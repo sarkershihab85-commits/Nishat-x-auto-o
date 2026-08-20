@@ -862,7 +862,8 @@ def main():
     app.add_handler(CommandHandler("optout", optout))
     for command in ("useron", "useroff", "userremove", "userstatus", "retry"):
         app.add_handler(CommandHandler(command, manage_user))
-    def main():
+
+def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("optin", optin))
