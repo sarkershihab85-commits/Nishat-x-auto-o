@@ -211,6 +211,12 @@ if mode == "mention" and not mentioned:
         return
     if mode == "ask" and not text.lower().startswith("/ask"):
         return
+    if mode == "mention" and not mentioned:
+        return
+    if mode == "reply" and not replied_to_bot:
+        return
+    if mode == "ask" and not text.lower().startswith("/ask"):
+        return
     if mode == "question" and not (text.endswith(("?", "？")) or "?" in text):
         return
     if mode == "ask":
@@ -223,7 +229,6 @@ if mode == "mention" and not mentioned:
         await message.reply_text("⚠️ AI উত্তর দিতে পারেনি। কিছুক্ষণ পর আবার চেষ্টা করুন।")
         with open(DATA_DIR / "ai_errors.log", "a", encoding="utf-8") as file:
             file.write(f"group={chat_id} error={error}\n")
-
 
 async def send_campaign(bot):
     campaign = settings.get("user_campaign", {})
