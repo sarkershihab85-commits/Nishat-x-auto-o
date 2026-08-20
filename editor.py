@@ -1,23 +1,39 @@
-"""Minimal, structure-preserving post formatting.
-
-The editor intentionally does not rewrite the post. It only normalizes spacing
-and adds a small amount of configurable decoration, so source formatting and
-meaning remain intact.
-"""
 import re
 
+# ═══ এডিটর — পোস্ট ক্লিন, ফরম্যাট, টেমপ্লেট ═══
 
-def edit_post(text: str, emoji_enabled: bool = True) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    if not emoji_enabled or not text:
-        return text
+def clean_text(text: str) -> str:
+    """অতিরিক্ত স্পেস, লাইন পরিষ্কার"""
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+    return text
 
-    # Add decoration only to common announcement-like headings that do not
-    # already start with an emoji. Do not alter ordinary paragraphs.
-    first = text.split("\n", 1)[0].strip()
-    if first and not re.match(r"^[\U0001F300-\U0001FAFF\u2600-\u27BF]", first):
-        if re.search(r"(অফার|ছাড়|জরুরি|আপডেট|নতুন|offer|update|breaking)", first, re.I):
-            text = "📢 " + text
+
+def apply_template(text: str, header: str = "", footer: str = "") -> str:
+    """হেডার/ফুটার যোগ"""
+    parts = []
+    if header:
+        parts.append(header)
+    parts.append(text)
+    if footer:
+        parts.append(footer)
+    return "\n\n".join(parts)
+
+
+def apply_replacements(text: str, replacements: dict) -> str:
+    """শব্দ প্রতিস্থাপন"""
+    for old, new in replacements.items():
+        if old and new:
+            text = text.replace(old, new)
+    return text
+
+
+def format_post(text: str, settings: dict) -> str:
+    """পুরো পাইপলাইন: ক্লিন → রিপ্লেস → টেমপ্লেট"""
+    text = clean_text(text)
+    text = apply_replacements(text, settings.get("replacements", {}))
+    header = settings.get("template", {}).get("header", "")
+    footer = settings.get("template", {}).get("footer", "")
+    text = apply_template(text, header, footer)
     return text
