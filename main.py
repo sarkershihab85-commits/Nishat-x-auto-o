@@ -78,8 +78,18 @@ def ai_kb():
         ["🟢 AI Editing চালু", "🔴 AI Editing বন্ধ"],
         ["🎨 AI Style", "🧠 Custom Prompt"],
         ["📏 Post Length", "✨ AI Emoji ON/OFF"],
+        ["🎭 AI পরিচয় সেটিংস"],
         ["👥 Group AI সেটিংস"],
         ["⬅️ ফিরে যান"],
+    ], resize_keyboard=True)
+
+
+def ai_identity_kb():
+    return ReplyKeyboardMarkup([
+        ["🤖 AI-র নাম", "👑 Owner-এর নাম"],
+        ["🚫 অতিরিক্ত Filter/নিষেধ"],
+        ["📄 Master নির্দেশনা (Text/File)"],
+        ["⬅️ AI সেটিংসে ফিরুন"],
     ], resize_keyboard=True)
 
 
@@ -128,20 +138,26 @@ def is_admin(uid): return uid in ADMIN_IDS
 
 async def optin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    record = settings.setdefault("users", {}).setdefault(str(user.id), {})
+    key = str(user.id)
+    username_key = (user.username or "").lstrip("@")
+    users = settings.setdefault("users", {})
+    # যদি admin আগে থেকে @username দিয়ে pre-add করে রাখে, সেই পুরনো enable/status ধরে রেখে
+    # numeric ID-তে merge করে দেওয়া হচ্ছে — send_message-এর জন্য numeric ID-ই আসল key।
+    existing = users.pop(username_key, None) if username_key and username_key in users and username_key != key else None
+    record = users.setdefault(key, existing or {})
     record.update({
         "id": user.id,
         "username": user.username or "",
         "name": user.full_name or "",
         "opted_in": True,
-        "enabled": True,
+        "enabled": record.get("enabled", True),
         "status": "ready",
     })
-    username_key = (user.username or "").lstrip("@")
-    if username_key and username_key in settings.get("users", {}):
-        settings["users"][username_key] = record
-        if username_key not in settings["user_campaign"]["user_ids"]:
-            settings["user_campaign"]["user_ids"].append(username_key)
+    campaign_ids = settings.setdefault("user_campaign", {}).setdefault("user_ids", [])
+    if username_key and username_key in campaign_ids:
+        campaign_ids.remove(username_key)
+    if key not in campaign_ids:
+        campaign_ids.append(key)
     save_settings(settings)
     await update.message.reply_text("✅ আপনি opt-in করেছেন। এখন থেকে Admin-এর অনুমোদিত message পেতে পারেন।")
 
@@ -220,8 +236,15 @@ async def handle_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if mode == "ask":
         text = text[4:].strip()
+    identity = {
+        "identity_name": settings.get("ai", {}).get("identity_name", ""),
+        "owner_name": settings.get("ai", {}).get("owner_name", ""),
+        "identity_filter": settings.get("ai", {}).get("identity_filter", ""),
+        "master_instruction": settings.get("ai", {}).get("master_instruction", ""),
+    }
+    group_context = {**identity, **group}
     try:
-        answer = await answer_group_message(text, group, "")
+        answer = await answer_group_message(text, group_context, "")
         await message.reply_text(answer[:4000], disable_web_page_preview=True)
     except Exception as error:
         print(f"⚠️ AI ERROR group={chat_id}: {repr(error)}", flush=True)
@@ -290,6 +313,36 @@ async def handle_forward(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Destination যোগ হয়েছে!\n\n📛 নাম: {fwd.title}\n🆔 ID: {fwd.id}",
         reply_markup=channel_kb())
 
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    if user_state.get(uid, {}).get("step") != "await_master_instruction":
+        return
+    doc = update.message.document
+    if not doc:
+        return
+    if doc.file_size and doc.file_size > 200_000:
+        await update.message.reply_text("⚠️ ফাইল খুব বড় (সর্বোচ্চ ~200KB)। ছোট .txt ফাইল পাঠান।")
+        return
+    try:
+        file = await ctx.bot.get_file(doc.file_id)
+        raw = await file.download_as_bytearray()
+        content = bytes(raw).decode("utf-8", errors="replace").strip()
+    except Exception as error:
+        await update.message.reply_text(f"❌ ফাইল পড়তে সমস্যা হয়েছে: {error}")
+        return
+    if not content:
+        await update.message.reply_text("⚠️ ফাইলটা খালি মনে হচ্ছে।")
+        return
+    settings["ai"]["master_instruction"] = content[:8000]
+    save_settings(settings)
+    user_state.pop(uid, None)
+    await update.message.reply_text(
+        f"✅ ফাইল থেকে Master নির্দেশনা সেভ হয়েছে ({len(content)} অক্ষর)। AI এখন থেকে এই নিয়ম মেনে চলবে।",
+        reply_markup=ai_identity_kb())
+
+
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = update.message.text
     uid = update.effective_user.id
@@ -319,6 +372,30 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_settings(settings)
         user_state.pop(uid, None)
         await update.message.reply_text("✅ AI সেটিংস সেভ হয়েছে।", reply_markup=ai_kb())
+        return
+
+    if uid in user_state and user_state[uid]["step"] in ("await_ai_identity_name", "await_ai_owner_name", "await_ai_identity_filter"):
+        field = {
+            "await_ai_identity_name": "identity_name",
+            "await_ai_owner_name": "owner_name",
+            "await_ai_identity_filter": "identity_filter",
+        }[user_state[uid]["step"]]
+        settings["ai"][field] = "" if t.strip() in ("না", "-", "খালি") else t.strip()
+        save_settings(settings)
+        user_state.pop(uid, None)
+        await update.message.reply_text("✅ AI পরিচয় সেটিংস সেভ হয়েছে।", reply_markup=ai_identity_kb())
+        return
+
+    if uid in user_state and user_state[uid]["step"] == "await_master_instruction":
+        if t.strip() in ("না", "-", "খালি"):
+            settings["ai"]["master_instruction"] = ""
+        else:
+            settings["ai"]["master_instruction"] = t.strip()[:8000]
+        save_settings(settings)
+        user_state.pop(uid, None)
+        await update.message.reply_text(
+            "✅ Master নির্দেশনা সেভ হয়েছে। AI এখন থেকে এই নিয়ম মেনে সব জায়গায় কাজ করবে।",
+            reply_markup=ai_identity_kb())
         return
 
     if uid in user_state and user_state[uid]["step"] == "await_users":
@@ -697,6 +774,44 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Mode: always / question / mention / reply / ask\n"
             "উদাহরণ: -100123456789 on mention", reply_markup=ai_kb())
 
+    elif t in ("🎭 AI পরিচয় সেটিংস", "⬅️ AI সেটিংসে ফিরুন"):
+        if t == "⬅️ AI সেটিংসে ফিরুন":
+            await update.message.reply_text("🤖 AI সেটিংসে ফিরে গেলাম।", reply_markup=ai_kb())
+        else:
+            ai = settings["ai"]
+            master = ai.get("master_instruction") or ""
+            master_preview = (master[:200] + "...") if len(master) > 200 else (master or "(সেট করা নেই)")
+            await update.message.reply_text(
+                f"🎭 AI পরিচয় সেটিংস\n\n"
+                f"AI-র নাম: {ai.get('identity_name') or '(সেট করা নেই — default AI পরিচয় দেবে)'}\n"
+                f"Owner-এর নাম: {ai.get('owner_name') or '(সেট করা নেই — মালিকের প্রশ্ন এড়িয়ে যাবে)'}\n"
+                f"Filter/নিষেধ: {ai.get('identity_filter') or '(খালি)'}\n"
+                f"Master নির্দেশনা: {master_preview}\n\n"
+                f"এই সেটিংস অনুযায়ী AI কখনো ChatGPT/OpenAI/Groq-এর নাম বলবে না, "
+                f"বরং আপনার দেওয়া পরিচয়/মালিক-এর নাম বলবে এবং Master নির্দেশনা সবসময় মেনে চলবে।",
+                reply_markup=ai_identity_kb())
+
+    elif t in ("🤖 AI-র নাম", "👑 Owner-এর নাম", "🚫 অতিরিক্ত Filter/নিষেধ"):
+        steps = {
+            "🤖 AI-র নাম": "await_ai_identity_name",
+            "👑 Owner-এর নাম": "await_ai_owner_name",
+            "🚫 অতিরিক্ত Filter/নিষেধ": "await_ai_identity_filter",
+        }
+        prompts = {
+            "🤖 AI-র নাম": "AI নিজেকে যে নামে পরিচয় দেবে সেটা লিখুন (উদাহরণ: Nishat X AI)। খালি করতে 'না' লিখুন।",
+            "👑 Owner-এর নাম": "'তোমার মালিক কে' জিজ্ঞেস করলে AI যে নাম বলবে সেটা লিখুন। খালি করতে 'না' লিখুন।",
+            "🚫 অতিরিক্ত Filter/নিষেধ": "AI যা যা বলতে পারবে না তা লিখুন (যেমন: ফোন নম্বর/ঠিকানা কখনো বলবে না)। খালি করতে 'না' লিখুন।",
+        }
+        user_state[uid] = {"step": steps[t]}
+        await update.message.reply_text(prompts[t])
+
+    elif t == "📄 Master নির্দেশনা (Text/File)":
+        user_state[uid] = {"step": "await_master_instruction"}
+        await update.message.reply_text(
+            "AI কীভাবে আচরণ করবে, কী কী উত্তর দেবে/দেবে না — পুরো নিয়ম এখানে লিখে পাঠান, "
+            "অথবা সরাসরি একটা .txt ফাইল পাঠান (ফাইলের ভেতরের লেখাটাই নির্দেশনা হিসেবে সেভ হবে)।\n"
+            "খালি করতে 'না' লিখুন।")
+
     elif t == "📩 User Messaging":
         campaign = settings["user_campaign"]
         await update.message.reply_text(
@@ -864,6 +979,7 @@ def main():
     for command in ("useron", "useroff", "userremove", "userstatus", "retry"):
         app.add_handler(CommandHandler(command, manage_user))
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forward))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_group))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle))
     print(r"""
