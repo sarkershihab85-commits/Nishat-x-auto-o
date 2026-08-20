@@ -205,12 +205,7 @@ async def handle_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     group = settings.setdefault("group_ai", {}).get(chat_id, {})
     if not group.get("enabled", False):
-        return
-    text = message.text.strip()
-    mode = group.get("reply_mode", "question")
-    mentioned = ctx.bot.username and f"@{ctx.bot.username.lower()}" in text.lower()
-    replied_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.is_bot)
-    if mode == "mention" and not mentioned:
+if mode == "mention" and not mentioned:
         return
     if mode == "reply" and not replied_to_bot:
         return
@@ -224,6 +219,7 @@ async def handle_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         answer = await answer_group_message(text, group, "")
         await message.reply_text(answer[:4000], disable_web_page_preview=True)
     except Exception as error:
+        print(f"⚠️ AI ERROR group={chat_id}: {repr(error)}", flush=True)
         await message.reply_text("⚠️ AI উত্তর দিতে পারেনি। কিছুক্ষণ পর আবার চেষ্টা করুন।")
         with open(DATA_DIR / "ai_errors.log", "a", encoding="utf-8") as file:
             file.write(f"group={chat_id} error={error}\n")
