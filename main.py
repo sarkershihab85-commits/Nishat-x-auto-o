@@ -105,23 +105,22 @@ async def campaign_loop(application):
     while True:
         await asyncio.sleep(60)
         if settings.get("user_campaign", {}).get("enabled"):
-            campaign = settings.get("user_campaign", {})
+            campaign = settings["user_campaign"]
             message = campaign.get("message", "").strip()
             if message:
-                for uid in campaign.get("user_ids", []):
-                    record = settings.get("users", {}).get(str(uid), {})
+                for uid_str in campaign.get("user_ids", []):
+                    record = settings.get("users", {}).get(str(uid_str), {})
                     if not record.get("opted_in") or not record.get("enabled", True):
                         continue
                     try:
-                        await application.bot.send_message(chat_id=record.get("id", uid), text=message)
+                        await application.bot.send_message(chat_id=record.get("id", uid_str), text=message)
                         record["status"] = "sent"
                     except Exception as e:
                         record["status"] = f"failed: {str(e)[:80]}"
                     save_settings(settings)
-            settings["user_campaign"]["enabled"] = False
+            campaign["enabled"] = False
             save_settings(settings)
 
-# ═══ post_init: application start-এর পরে task চালু ═══
 async def post_init(application):
     application.create_task(campaign_loop(application))
 
@@ -135,6 +134,55 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "নিচের বাটন থেকে যেকোনো মেনু খুলুন — সব ধাপে ধাপে পরিচালিত হবে।",
         reply_markup=main_kb())
 
+async def optin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    record = settings.setdefault("users", {}).setdefault(str(user.id), {})
+    record.update({
+        "id": user.id,
+        "username": user.username or "",
+        "name": user.full_name or "",
+        "opted_in": True,
+        "enabled": True,
+        "status": "ready",
+    })
+    save_settings(settings)
+    await update.message.reply_text("✅ আপনি opt-in করেছেন। এখন থেকে Admin-এর অনুমোদিত message পেতে পারেন।")
+
+async def optout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    record = settings.setdefault("users", {}).setdefault(str(user.id), {})
+    record.update({"id": user.id, "opted_in": False, "enabled": False, "status": "opted_out"})
+    save_settings(settings)
+    await update.message.reply_text("✅ আপনি opt-out করেছেন। আর campaign message পাঠানো হবে না।")
+
+async def handle_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message or not message.text or not update.effective_chat:
+        return
+    chat_id = str(update.effective_chat.id)
+    group = settings.setdefault("group_ai", {}).get(chat_id, {})
+    if not group.get("enabled", False):
+        return
+    text = message.text.strip()
+    mode = group.get("reply_mode", "question")
+    mentioned = ctx.bot.username and f"@{ctx.bot.username.lower()}" in text.lower()
+    replied_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.is_bot)
+    if mode == "mention" and not mentioned:
+        return
+    if mode == "reply" and not replied_to_bot:
+        return
+    if mode == "ask" and not text.lower().startswith("/ask"):
+        return
+    if mode == "question" and not (text.endswith(("?", "？")) or "?" in text):
+        return
+    if mode == "ask":
+        text = text[4:].strip()
+    try:
+        answer = await answer_group_message(text, group, "")
+        await message.reply_text(answer[:4000], disable_web_page_preview=True)
+    except Exception as error:
+        await message.reply_text("⚠️ AI উত্তর দিতে পারেনি। কিছুক্ষণ পর আবার চেষ্টা করুন।")
+
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = update.message.text
     uid = update.effective_user.id
@@ -142,66 +190,17 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ অনুমতি নেই।")
         return
 
-    # ── স্টেট-ভিত্তিক ইনপুট ──
-    state = user_state.get(uid)
+    # ── স্টেট চেক ──
+    if uid in user_state:
+        step = user_state[uid]["step"]
 
-    if state and state["step"] == "await_delay":
-        if not t.strip().isdigit():
-            await update.message.reply_text("⚠️ শুধু সংখ্যা লিখুন।")
-            return
-        settings["delay_minutes"] = int(t.strip())
-        save_settings(settings)
-        user_state.pop(uid, None)
-        await update.message.reply_text(f"✅ ডিলে সেট: **{t.strip()} মিনিট**", reply_markup=settings_kb())
-        return
-
-    if state and state["step"] in ("await_tmpl_header", "await_tmpl_footer"):
-        if state["step"] == "await_tmpl_header":
-            settings["template"]["header"] = t
-            save_settings(settings)
-            user_state[uid]["step"] = "await_tmpl_footer"
-            await update.message.reply_text("✅ হেডার সেভ!\n\n📝 এখন **ফুটার** লিখুন (না চাইলে 'না' লিখুন):")
-            return
-        else:
-            if t.lower() != "না":
-                settings["template"]["footer"] = t
-            save_settings(settings)
-            user_state.pop(uid, None)
-            await update.message.reply_text(
-                f"✅ টেমপ্লেট সেভ!\n\n📌 হেডার: {settings['template']['header'] or '(খালি)'}\n📌 ফুটার: {settings['template']['footer'] or '(খালি)'}",
-                reply_markup=settings_kb())
-            return
-
-    if state and state["step"] == "await_ai_style":
-        settings["ai"]["style"] = "" if t.strip() in ("না", "-") else t.strip()
-        save_settings(settings)
-        user_state.pop(uid, None)
-        await update.message.reply_text("✅ AI Style সেভ!", reply_markup=ai_kb())
-        return
-
-    if state and state["step"] == "await_ai_prompt":
-        settings["ai"]["custom_prompt"] = "" if t.strip() in ("না", "-") else t.strip()
-        save_settings(settings)
-        user_state.pop(uid, None)
-        await update.message.reply_text("✅ Custom Prompt সেভ!", reply_markup=ai_kb())
-        return
-
-    if state and state["step"] == "await_ai_length":
-        settings["ai"]["length"] = "" if t.strip() in ("না", "-") else t.strip()
-        save_settings(settings)
-        user_state.pop(uid, None)
-        await update.message.reply_text("✅ Post Length সেভ!", reply_markup=ai_kb())
-        return
-
-    if state and state["step"] == "await_channel":
-        stype = state["type"]
-        # Source Add / Remove
-        if stype in ("source_add", "source_remove"):
-            username = t.replace("https://t.me/", "").replace("https://t.me/", "").replace("@", "").split("/")[0].strip()
+        if step == "await_channel":
+            state_type = user_state[uid]["type"]
             try:
+                username = t.replace("https://t.me/", "").replace("@", "").split("/")[0]
                 chat = await ctx.bot.get_chat(f"@{username}")
-                source = f"@{chat.username}" if chat.username else str(chat.id)
-                if stype == "source_add":
+                if state_type == "source_add":
+                    source = f"@{chat.username}" if chat.username else str(chat.id)
                     if source not in settings["sources"]:
                         settings["sources"].append(source)
                     save_settings(settings)
@@ -209,24 +208,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(
                         f"✅ Source যোগ হয়েছে!\n\n📛 {chat.title}\n🆔 {chat.id}",
                         reply_markup=channel_kb())
-                else:
-                    if source in settings["sources"]:
-                        settings["sources"].remove(source)
-                    save_settings(settings)
-                    user_state.pop(uid, None)
-                    await update.message.reply_text("✅ Source বাদ দেওয়া হয়েছে।", reply_markup=channel_kb())
-            except Exception:
-                await update.message.reply_text(
-                    "❌ চ্যানেল পাওয়া যায়নি।\n\n💡 বটকে চ্যানেলে অ্যাডমিন বানান, তারপর URL দিন।",
-                    reply_markup=channel_kb())
-            return
-
-        # Destination Add / Remove
-        if stype in ("destination_add", "destination_remove"):
-            if stype == "destination_add":
-                username = t.replace("https://t.me/", "").replace("@", "").split("/")[0].strip()
-                try:
-                    chat = await ctx.bot.get_chat(f"@{username}")
+                elif state_type == "destination_add":
                     if chat.id not in settings["destinations"]:
                         settings["destinations"].append(chat.id)
                     save_settings(settings)
@@ -234,135 +216,178 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(
                         f"✅ Destination যোগ হয়েছে!\n\n📛 {chat.title}\n🆔 {chat.id}",
                         reply_markup=channel_kb())
-                except Exception:
-                    await update.message.reply_text(
-                        "❌ চ্যানেল পাওয়া যায়নি।\n\n💡 বটকে চ্যানেলে অ্যাডমিন বানান।",
-                        reply_markup=channel_kb())
-            else:
-                value = t.strip()
-                if value.isdigit() and int(value) in settings["destinations"]:
-                    settings["destinations"].remove(int(value))
+                elif state_type == "source_remove":
+                    target = settings["sources"]
+                    found = False
+                    for item in list(target):
+                        if str(item).replace("@", "") == username or str(item) == t.strip():
+                            target.remove(item)
+                            found = True
                     save_settings(settings)
                     user_state.pop(uid, None)
-                    await update.message.reply_text("✅ Destination বাদ হয়েছে।", reply_markup=channel_kb())
-                else:
-                    await update.message.reply_text("⚠️ ID তালিকায় পাওয়া যায়নি।", reply_markup=channel_kb())
+                    await update.message.reply_text(
+                        f"{'✅ বাদ হয়েছে' if found else '⚠️ পাওয়া যায়নি'}: Source",
+                        reply_markup=channel_kb())
+                elif state_type == "destination_remove":
+                    target = settings["destinations"]
+                    found = False
+                    for item in list(target):
+                        if str(item) == t.strip() or str(item) == str(chat.id):
+                            target.remove(item)
+                            found = True
+                    save_settings(settings)
+                    user_state.pop(uid, None)
+                    await update.message.reply_text(
+                        f"{'✅ বাদ হয়েছে' if found else '⚠️ পাওয়া যায়নি'}: Destination",
+                        reply_markup=channel_kb())
+            except Exception:
+                await update.message.reply_text(
+                    "❌ চ্যানেল পাওয়া যায়নি।\n\n"
+                    "💡 বটকে চ্যানেলে অ্যাডমিন বানান।",
+                    reply_markup=channel_kb())
             return
 
-    if state and state["step"] == "await_forward_value":
-        field = state["field"]
-        value = t.strip()
-        if field in ("repeat_count", "repeat_interval_minutes"):
-            if not value.isdigit():
-                await update.message.reply_text("⚠️ শুধু সংখ্যা দিন।")
+        if step == "await_delay":
+            if not t.strip().isdigit():
+                await update.message.reply_text("⚠️ শুধু সংখ্যা লিখুন।")
                 return
-            settings["forwarding"][field] = int(value)
-        else:
-            settings["forwarding"]["enabled"] = value.lower() in ("চালু", "on", "yes", "1")
-        save_settings(settings)
-        user_state.pop(uid, None)
-        await update.message.reply_text("✅ Forward সেটিংস আপডেট!", reply_markup=settings_kb())
-        return
+            settings["delay_minutes"] = int(t.strip())
+            save_settings(settings)
+            user_state.pop(uid, None)
+            await update.message.reply_text(f"✅ ডিলে: {t.strip()} মিনিট", reply_markup=settings_kb())
+            return
 
-    # Channel→Group states
-    if state and state["step"] in ("await_cg_add", "await_cg_select", "await_cg_count",
-                                    "await_cg_delay", "await_cg_schedule"):
-        fwd = settings["channel_group_forwarding"]
-        if state["step"] == "await_cg_add":
-            value = t.strip()
-            group = value if value.startswith("@") else (int(value) if value.lstrip("-").isdigit() else f"@{value}")
-            key = str(group)
-            fwd["groups"].setdefault(key, {
+        if step in ("await_tmpl_header", "await_tmpl_footer"):
+            if step == "await_tmpl_header":
+                settings["template"]["header"] = t
+                save_settings(settings)
+                user_state[uid]["step"] = "await_tmpl_footer"
+                await update.message.reply_text("✅ হেডার সেভ!\n\n📝 এখন **ফুটার** লিখুন (না চাইলে 'না'):")
+            else:
+                if t.lower() != "না":
+                    settings["template"]["footer"] = t
+                save_settings(settings)
+                user_state.pop(uid, None)
+                await update.message.reply_text(
+                    f"✅ টেমপ্লেট সেভ!\n\n📌 হেডার: {settings['template']['header'] or 'খালি'}\n"
+                    f"📌 ফুটার: {settings['template']['footer'] or 'খালি'}",
+                    reply_markup=settings_kb())
+            return
+
+        if step in ("await_ai_style", "await_ai_prompt", "await_ai_length"):
+            field = {"await_ai_style": "style", "await_ai_prompt": "custom_prompt", "await_ai_length": "length"}[step]
+            settings["ai"][field] = "" if t.strip() in ("না", "-", "খালি") else t.strip()
+            save_settings(settings)
+            user_state.pop(uid, None)
+            await update.message.reply_text("✅ AI সেটিংস সেভ!", reply_markup=ai_kb())
+            return
+
+        if step == "await_users":
+            values = [item.strip() for item in t.replace(",", "\n").splitlines() if item.strip()]
+            for value in values:
+                key = value.lstrip("@")
+                if key not in settings["user_campaign"]["user_ids"]:
+                    settings["user_campaign"]["user_ids"].append(key)
+                settings.setdefault("users", {}).setdefault(key, {
+                    "id": int(key) if key.isdigit() else key,
+                    "username": value if value.startswith("@") else "",
+                    "opted_in": False,
+                    "enabled": True,
+                    "status": "waiting for opt-in",
+                })
+            save_settings(settings)
+            user_state.pop(uid, None)
+            await update.message.reply_text(f"✅ {len(values)} জন user যোগ হয়েছে।", reply_markup=user_message_kb())
+            return
+
+        if step == "await_campaign_message":
+            settings["user_campaign"]["message"] = t
+            save_settings(settings)
+            user_state.pop(uid, None)
+            await update.message.reply_text("✅ Message সেভ!", reply_markup=user_message_kb())
+            return
+
+        if step == "await_cg_add":
+            group_id = t.strip()
+            forwarding = settings["channel_group_forwarding"]
+            forwarding["groups"].setdefault(group_id, {
                 "enabled": True, "paused": False, "count": 1, "delay_seconds": 0,
                 "ai_enabled": False, "schedule": {"enabled": False, "start": "00:00", "end": "23:59"},
                 "status": "active",
             })
-            fwd["selected_group"] = key
+            forwarding["selected_group"] = group_id
             save_settings(settings)
             user_state.pop(uid, None)
-            await update.message.reply_text(f"✅ Group যোগ + Selected: {key}", reply_markup=channel_group_kb())
+            await update.message.reply_text(f"✅ Group যোগ + selected: {group_id}", reply_markup=channel_group_kb())
             return
 
-        if state["step"] == "await_cg_select":
-            key = t.strip() if t.strip() in fwd["groups"] else (f"@{t.strip()}" if f"@{t.strip()}" in fwd["groups"] else t.strip())
-            if key not in fwd["groups"]:
-                await update.message.reply_text("⚠️ এই Group list-এ নেই।", reply_markup=channel_group_kb())
+        if step == "await_cg_select":
+            key = t.strip()
+            forwarding = settings["channel_group_forwarding"]
+            if key not in forwarding["groups"]:
+                await update.message.reply_text("⚠️ Group পাওয়া যায়নি।", reply_markup=channel_group_kb())
                 return
-            fwd["selected_group"] = key
+            forwarding["selected_group"] = key
             save_settings(settings)
             user_state.pop(uid, None)
             await update.message.reply_text(f"✅ Selected: {key}", reply_markup=channel_group_kb())
             return
 
-        group = selected_forward_group()
-        if not group:
+        if step == "await_cg_count":
+            group = selected_forward_group()
+            if group and t.strip().isdigit():
+                group["count"] = max(1, min(20, int(t.strip())))
+                save_settings(settings)
             user_state.pop(uid, None)
-            await update.message.reply_text("⚠️ আগে Group যোগ করুন।", reply_markup=channel_group_kb())
+            await update.message.reply_text("✅ Count সেভ!", reply_markup=channel_group_kb())
             return
 
-        value = t.strip()
-        if state["step"] == "await_cg_count" and value.isdigit():
-            group["count"] = max(1, min(20, int(value)))
-        elif state["step"] == "await_cg_delay" and value.isdigit():
-            group["delay_seconds"] = max(0, int(value))
-        elif state["step"] == "await_cg_schedule":
-            parts = value.split()
-            if len(parts) == 3 and parts[0].lower() in ("on", "off"):
-                group["schedule"] = {"enabled": parts[0].lower() == "on", "start": parts[1], "end": parts[2]}
-            else:
-                await update.message.reply_text("Format: `on 09:00 23:00` অথবা `off 00:00 23:59`")
-                return
-        else:
-            await update.message.reply_text("⚠️ সঠিক মান লিখুন।")
+        if step == "await_cg_delay":
+            group = selected_forward_group()
+            if group and t.strip().isdigit():
+                group["delay_seconds"] = max(0, int(t.strip()))
+                save_settings(settings)
+            user_state.pop(uid, None)
+            await update.message.reply_text("✅ Delay সেভ!", reply_markup=channel_group_kb())
             return
-        save_settings(settings)
-        user_state.pop(uid, None)
-        await update.message.reply_text("✅ সেভ হয়েছে!", reply_markup=channel_group_kb())
-        return
 
     # ── মূল মেনু ──
     if t == "📡 চ্যানেল সেটিংস":
-        await update.message.reply_text("📡 চ্যানেল সেটিংস\n\nকোনটি খুলবেন?", reply_markup=channel_kb())
+        await update.message.reply_text("📡 চ্যানেল সেটিংস", reply_markup=channel_kb())
 
     elif t == "🏠 Destination":
-        lst = "\n".join(f"🟢 {d}" for d in settings["destinations"]) or "খালি"
-        await update.message.reply_text(f"🏠 Destination চ্যানেল:\n{lst}", reply_markup=channel_kb())
+        lst = "\n".join(f"🟢 {ch}" for ch in settings["destinations"]) or "খালি"
+        await update.message.reply_text(f"🏠 Destination:\n{lst}", reply_markup=channel_kb())
 
     elif t == "📡 Source":
         lst = "\n".join(f"📡 {s}" for s in settings["sources"]) or "খালি"
-        await update.message.reply_text(f"📡 Source চ্যানেল:\n{lst}", reply_markup=channel_kb())
+        await update.message.reply_text(f"📡 Source:\n{lst}", reply_markup=channel_kb())
 
-    elif t == "➕ Source যোগ":
-        user_state[uid] = {"step": "await_channel", "type": "source_add"}
-        await update.message.reply_text("Source চ্যানেলের @username বা t.me লিংক পাঠান।", reply_markup=channel_kb())
+    elif t in ("➕ Source যোগ", "➕ Destination যোগ"):
+        is_src = "Source" in t
+        user_state[uid] = {"step": "await_channel", "type": "source_add" if is_src else "destination_add"}
+        label = "Source" if is_src else "Destination"
+        await update.message.reply_text(f"{label} যোগ: @username বা t.me লিংক পাঠান।", reply_markup=channel_kb())
 
-    elif t == "➖ Source বাদ":
-        user_state[uid] = {"step": "await_channel", "type": "source_remove"}
-        await update.message.reply_text("বাদ দিতে চাওয়া Source-এর @username লিখুন।", reply_markup=channel_kb())
-
-    elif t == "➕ Destination যোগ":
-        user_state[uid] = {"step": "await_channel", "type": "destination_add"}
-        await update.message.reply_text("Destination চ্যানেলের @username বা t.me লিংক পাঠান।", reply_markup=channel_kb())
-
-    elif t == "➖ Destination বাদ":
-        user_state[uid] = {"step": "await_channel", "type": "destination_remove"}
-        await update.message.reply_text("বাদ দিতে চাওয়া Destination-এর ID লিখুন।", reply_markup=channel_kb())
+    elif t in ("➖ Source বাদ", "➖ Destination বাদ"):
+        is_src = "Source" in t
+        user_state[uid] = {"step": "await_channel", "type": "source_remove" if is_src else "destination_remove"}
+        label = "Source" if is_src else "Destination"
+        await update.message.reply_text(f"{label} বাদ: @username লিখুন।", reply_markup=channel_kb())
 
     elif t == "🛡️ প্রাইভেসি ফিল্টার":
-        await update.message.reply_text(
-            "🛡️ প্রাইভেসি ফিল্টার\n\nযে তথ্য মুছে যাবে — ON/OFF করুন:", reply_markup=privacy_kb())
+        await update.message.reply_text("🛡️ প্রাইভেসি ফিল্টার — চাপ দিয়ে ON/OFF:", reply_markup=privacy_kb())
 
     elif t in ("👤 @username", "📞 ফোন", "✉️ ইমেইল", "🔗 t.me লিংক"):
-        key = {"👤 @username": "username", "📞 ফোন": "phone",
-               "✉️ ইমেইল": "email", "🔗 t.me লিংক": "tme_link"}[t]
+        key = {"👤 @username": "username", "📞 ফোন": "phone", "✉️ ইমেইল": "email", "🔗 t.me লিংক": "tme_link"}[t]
         settings["privacy"][key]["on"] = not settings["privacy"][key]["on"]
         save_settings(settings)
         st = "🟢 চালু" if settings["privacy"][key]["on"] else "🔴 বন্ধ"
         await update.message.reply_text(f"✅ {t}: {st}", reply_markup=privacy_kb())
 
     elif t == "📝 অটো পোস্ট":
-        status = "🟢 চালু" if settings.get("autopost") else "🔴 বন্ধ"
-        await update.message.reply_text(f"📝 অটো পোস্ট\n\nঅবস্থা: {status}", reply_markup=autopost_kb())
+        st = "🟢 চালু" if settings.get("autopost") else "🔴 বন্ধ"
+        await update.message.reply_text(f"📝 অটো পোস্ট: {st}", reply_markup=autopost_kb())
 
     elif t == "🟢 চালু করুন":
         set_autopost(True)
@@ -370,10 +395,10 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif t == "🔴 বন্ধ করুন":
         set_autopost(False)
-        await update.message.reply_text("🔴 অটো পোস্ট বন্ধ।", reply_markup=autopost_kb())
+        await update.message.reply_text("✅ অটো পোস্ট বন্ধ!", reply_markup=autopost_kb())
 
     elif t == "📊 পরিসংখ্যান":
-        pub = skip = 0
+        pub, skip = 0, 0
         try:
             with open(DATA_DIR / "posts.log") as f:
                 for line in f:
@@ -382,114 +407,8 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except FileNotFoundError:
             pass
         await update.message.reply_text(
-            f"📊 পরিসংখ্যান\n\n✅ পাবলিশ: {pub}\n⏭️ স্কিপ: {skip}\n📡 সোর্স: {len(settings.get('sources', []))}\n🏠 ডেস্টিনেশন: {len(settings.get('destinations', []))}",
-            reply_markup=main_kb())
-
-    elif t == "🤖 AI সেটিংস":
-        ai = settings["ai"]
-        await update.message.reply_text(
-            f"🤖 AI Post Editing\n\n"
-            f"অবস্থা: {'🟢 চালু' if ai['enabled'] else '🔴 বন্ধ'}\n"
-            f"Style: {ai['style']}\nLength: {ai['length']}\n"
-            f"Emoji: {'ON' if ai['emoji'] else 'OFF'}\n"
-            f"Custom prompt: {ai['custom_prompt'] or '(খালি)'}",
-            reply_markup=ai_kb())
-
-    elif t in ("🟢 AI Editing চালু", "🔴 AI Editing বন্ধ"):
-        settings["ai"]["enabled"] = t.startswith("🟢")
-        save_settings(settings)
-        await update.message.reply_text("✅ AI সেটিংস আপডেট!", reply_markup=ai_kb())
-
-    elif t == "✨ AI Emoji ON/OFF":
-        settings["ai"]["emoji"] = not settings["ai"].get("emoji", True)
-        save_settings(settings)
-        await update.message.reply_text("✅ AI Emoji আপডেট!", reply_markup=ai_kb())
-
-    elif t == "🎨 AI Style":
-        user_state[uid] = {"step": "await_ai_style"}
-        await update.message.reply_text("নতুন AI Style লিখুন। খালি করতে 'না'।")
-
-    elif t == "🧠 Custom Prompt":
-        user_state[uid] = {"step": "await_ai_prompt"}
-        await update.message.reply_text("Custom Prompt লিখুন। খালি করতে 'না'।")
-
-    elif t == "📏 Post Length":
-        user_state[uid] = {"step": "await_ai_length"}
-        await update.message.reply_text("Post Length (Short/Medium/Long) লিখুন।")
-
-    elif t == "📢 Channel → Group":
-        fwd = settings["channel_group_forwarding"]
-        await update.message.reply_text(
-            f"📢 Channel → Group\n\n"
-            f"অবস্থা: {'🟢 চালু' if fwd['enabled'] else '🔴 বন্ধ'}\n"
-            f"Group: {len(fwd['groups'])}\n"
-            f"Selected: {fwd.get('selected_group') or '(নেই)'}",
-            reply_markup=channel_group_kb())
-
-    elif t == "➕ Group যোগ":
-        user_state[uid] = {"step": "await_cg_add"}
-        await update.message.reply_text("Group ID বা @username পাঠান।")
-
-    elif t == "👥 Group List":
-        rows = []
-        for key, grp in settings["channel_group_forwarding"]["groups"].items():
-            st = "⏸️" if grp.get("paused") else ("🟢" if grp.get("enabled") else "🔴")
-            rows.append(f"{st} {key} — count:{grp.get('count',1)} delay:{grp.get('delay_seconds',0)}s")
-        await update.message.reply_text("\n".join(rows) or "খালি।", reply_markup=channel_group_kb())
-
-    elif t == "🎯 Select Group":
-        user_state[uid] = {"step": "await_cg_select"}
-        await update.message.reply_text("Group ID/@username পাঠান।")
-
-    elif t == "⚙️ Forward Settings":
-        grp = selected_forward_group()
-        if not grp:
-            await update.message.reply_text("⚠️ আগে Group যোগ করুন।", reply_markup=channel_group_kb())
-        else:
-            s = settings["channel_group_forwarding"]
-            await update.message.reply_text(
-                f"Selected: {s['selected_group']}\n"
-                f"Status: {'paused' if grp.get('paused') else ('active' if grp.get('enabled') else 'disabled')}\n"
-                f"Count: {grp.get('count',1)} | Delay: {grp.get('delay_seconds',0)}s\n"
-                f"AI: {'ON' if grp.get('ai_enabled') else 'OFF'}",
-                reply_markup=channel_group_kb())
-
-    elif t in ("🔢 Forward Count", "⏱️ Delay", "📅 Schedule"):
-        steps = {"🔢 Forward Count": "await_cg_count", "⏱️ Delay": "await_cg_delay", "📅 Schedule": "await_cg_schedule"}
-        if not selected_forward_group():
-            await update.message.reply_text("⚠️ আগে Group যোগ করুন।", reply_markup=channel_group_kb())
-        else:
-            user_state[uid] = {"step": steps[t]}
-            prompts = {"🔢 Forward Count": "Count (1-20) দিন।", "⏱️ Delay": "Delay seconds দিন।",
-                        "📅 Schedule": "`on 09:00 23:00` অথবা `off 00:00 23:59`"}
-            await update.message.reply_text(prompts[t])
-
-    elif t == "🤖 AI Editing":
-        grp = selected_forward_group()
-        if grp:
-            grp["ai_enabled"] = not grp.get("ai_enabled", False)
-            save_settings(settings)
-            await update.message.reply_text(f"✅ AI: {'ON' if grp['ai_enabled'] else 'OFF'}", reply_markup=channel_group_kb())
-        else:
-            await update.message.reply_text("⚠️ আগে Group যোগ করুন।", reply_markup=channel_group_kb())
-
-    elif t in ("🟢 C→G চালু", "🔴 C→G বন্ধ"):
-        settings["channel_group_forwarding"]["enabled"] = t.startswith("🟢")
-        save_settings(settings)
-        await update.message.reply_text("✅ Status আপডেট!", reply_markup=channel_group_kb())
-
-    elif t == "📊 Status":
-        rows = read_forward_history()
-        succ = sum(1 for r in rows if r.get("status") == "success")
-        fail = sum(1 for r in rows if r.get("status") == "error")
-        await update.message.reply_text(
-            f"📊 Status\n\nTotal: {len(rows)}\n✅ Success: {succ}\n❌ Failed: {fail}",
-            reply_markup=channel_group_kb())
-
-    elif t == "📝 History":
-        rows = read_forward_history()[-10:]
-        text = "\n".join(f"{r.get('time')} | {r.get('group')} | {r.get('status')}" for r in rows)
-        await update.message.reply_text(text or "History খালি।", reply_markup=channel_group_kb())
+            f"📊 পরিসংখ্যান\n\n✅ পাবলিশ: {pub}\n⏭️ স্কিপ: {skip}\n📡 সোর্স: {len(settings['sources'])}\n"
+            f"🏠 ডেস্টিনেশন: {len(settings['destinations'])}", reply_markup=main_kb())
 
     elif t == "⚙️ সেটিংস":
         await update.message.reply_text("⚙️ সেটিংস", reply_markup=settings_kb())
@@ -500,53 +419,156 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif t == "📝 টেমপ্লেট":
         user_state[uid] = {"step": "await_tmpl_header"}
-        await update.message.reply_text(
-            f"বর্তমান হেডার: {settings['template']['header'] or '(খালি)'}\n"
-            f"বর্তমান ফুটার: {settings['template']['footer'] or '(খালি)'}\n\n"
-            f"📝 নতুন **হেডার** লিখুন:")
+        await update.message.reply_text("📝 টেমপ্লেট হেডার লিখুন (না চাইলে 'না'):")
 
     elif t == "🔁 Forward সেটিংস":
-        fwd = settings["forwarding"]
+        fwd = settings.get("forwarding", {})
         await update.message.reply_text(
-            f"🔁 Forward\n\n"
-            f"Enabled: {'ON' if fwd['enabled'] else 'OFF'}\n"
-            f"Repeat: {fwd.get('repeat_count',1)}x\n"
-            f"Interval: {fwd.get('repeat_interval_minutes',0)} min",
+            f"🔁 Forward\n\nON/OFF: {'চালু' if fwd.get('enabled') else 'বন্ধ'}\n"
+            f"Repeat: {fwd.get('repeat_count', 1)} | Interval: {fwd.get('repeat_interval_minutes', 0)} মিনিট",
             reply_markup=settings_kb())
+
+    elif t == "🤖 AI সেটিংস":
+        ai = settings["ai"]
+        await update.message.reply_text(
+            f"🤖 AI\n\nঅবস্থা: {'🟢 চালু' if ai['enabled'] else '🔴 বন্ধ'}\n"
+            f"Style: {ai['style']}\nLength: {ai['length']}\nEmoji: {'ON' if ai['emoji'] else 'OFF'}",
+            reply_markup=ai_kb())
+
+    elif t in ("🟢 AI Editing চালু", "🔴 AI Editing বন্ধ"):
+        settings["ai"]["enabled"] = t.startswith("🟢")
+        save_settings(settings)
+        await update.message.reply_text("✅ AI আপডেট!", reply_markup=ai_kb())
+
+    elif t == "✨ AI Emoji ON/OFF":
+        settings["ai"]["emoji"] = not settings["ai"].get("emoji", True)
+        save_settings(settings)
+        await update.message.reply_text("✅ Emoji আপডেট!", reply_markup=ai_kb())
+
+    elif t in ("🎨 AI Style", "🧠 Custom Prompt", "📏 Post Length"):
+        steps = {"🎨 AI Style": "await_ai_style", "🧠 Custom Prompt": "await_ai_prompt", "📏 Post Length": "await_ai_length"}
+        user_state[uid] = {"step": steps[t]}
+        await update.message.reply_text("নতুন মান লিখুন। খালি করতে 'না'।")
+
+    elif t == "📢 Channel → Group":
+        fwd = settings["channel_group_forwarding"]
+        await update.message.reply_text(
+            f"📢 Channel → Group\n\n{'🟢 চালু' if fwd['enabled'] else '🔴 বন্ধ'}\n"
+            f"Groups: {len(fwd['groups'])}", reply_markup=channel_group_kb())
+
+    elif t == "➕ Group যোগ":
+        user_state[uid] = {"step": "await_cg_add"}
+        await update.message.reply_text("Group ID বা @username পাঠান।")
+
+    elif t == "👥 Group List":
+        rows = []
+        for key, g in settings["channel_group_forwarding"]["groups"].items():
+            st = "⏸️" if g.get("paused") else ("🟢" if g.get("enabled") else "🔴")
+            rows.append(f"{st} {key}")
+        await update.message.reply_text("\n".join(rows) or "খালি।", reply_markup=channel_group_kb())
+
+    elif t == "🎯 Select Group":
+        user_state[uid] = {"step": "await_cg_select"}
+        await update.message.reply_text("Group ID লিখুন।")
+
+    elif t == "⚙️ Forward Settings":
+        g = selected_forward_group()
+        if g:
+            await update.message.reply_text(f"Status: {g.get('enabled')}\nCount: {g.get('count', 1)}\nDelay: {g.get('delay_seconds', 0)}s", reply_markup=channel_group_kb())
+        else:
+            await update.message.reply_text("⚠️ আগে Group select করুন।", reply_markup=channel_group_kb())
+
+    elif t == "🔢 Forward Count":
+        user_state[uid] = {"step": "await_cg_count"}
+        await update.message.reply_text("Count (1-20):")
+
+    elif t == "⏱️ Delay":
+        user_state[uid] = {"step": "await_cg_delay"}
+        await update.message.reply_text("Delay seconds:")
+
+    elif t == "🤖 AI Editing":
+        g = selected_forward_group()
+        if g:
+            g["ai_enabled"] = not g.get("ai_enabled", False)
+            save_settings(settings)
+            await update.message.reply_text(f"✅ AI: {'ON' if g['ai_enabled'] else 'OFF'}", reply_markup=channel_group_kb())
+
+    elif t in ("🟢 C→G চালু", "🔴 C→G বন্ধ"):
+        g = selected_forward_group()
+        if g:
+            settings["channel_group_forwarding"]["enabled"] = t.startswith("🟢")
+            g["enabled"] = t.startswith("🟢")
+            save_settings(settings)
+            await update.message.reply_text("✅ আপডেট!", reply_markup=channel_group_kb())
+
+    elif t == "📊 Status":
+        await update.message.reply_text(f"📊 Status\n\nসোর্স: {len(settings['sources'])}\nডেস্টি: {len(settings['destinations'])}\nAutopost: {settings.get('autopost')}", reply_markup=channel_group_kb())
+
+    elif t == "📝 History":
+        rows = read_forward_history()[-10:]
+        text = "\n".join(f"{r.get('time','')} | {r.get('group','')} | {r.get('status','')}" for r in rows)
+        await update.message.reply_text(text or "খালি।", reply_markup=channel_group_kb())
 
     elif t == "❓ সাহায্য":
         await update.message.reply_text(
             "❓ সাহায্য\n\n"
-            "📡 চ্যানেল সেটিংস — Source/Destination যোগ করুন\n"
-            "📝 অটো পোস্ট — ON/OFF করুন\n"
-            "🛡️ প্রাইভেসি — ব্যক্তিগত তথ্য মুছুন\n"
-            "🤖 AI — পোস্ট এডিটিং\n"
-            "⚙️ সেটিংস — ডিলে, টেমপ্লেট",
-            reply_markup=main_kb())
+            "📡 চ্যানেল সেটিংস → Source/Destination যোগ\n"
+            "📝 অটো পোস্ট → চালু/বন্ধ\n"
+            "🛡️ প্রাইভেসি → ব্যক্তিগত তথ্য মুছুন\n"
+            "🤖 AI → পোস্ট এডিটিং\n"
+            "📢 Channel → Group → গ্রুপে ফরোয়ার্ড",
+        reply_markup=main_kb())
+
+    elif t == "➕ User যোগ":
+        user_state[uid] = {"step": "await_users"}
+        await update.message.reply_text("User ID বা @username দিন।")
+
+    elif t == "📝 Common Message":
+        user_state[uid] = {"step": "await_campaign_message"}
+        await update.message.reply_text("পাঠানো মেসেজ লিখুন।")
+
+    elif t == "📋 Queue":
+        await update.message.reply_text("📋 Queue: এখন খালি", reply_markup=main_kb())
 
     else:
-        await update.message.reply_text("💡 বাটন চাপুন অথবা /start লিখুন।", reply_markup=main_kb())
+        await update.message.reply_text("💡 বাটন চাপুন বা /start লিখুন।", reply_markup=main_kb())
 
 
-# ═══ মেইন ═══
+async def handle_forward(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    fwd = update.message.forward_from_chat
+    state = user_state.get(update.effective_user.id, {})
+    if not fwd or state.get("step") != "await_channel":
+        return
+    uid = update.effective_user.id
+    state_type = state.get("type", "")
+    if state_type == "destination_add":
+        if fwd.id not in settings["destinations"]:
+            settings["destinations"].append(fwd.id)
+        save_settings(settings)
+        user_state.pop(uid, None)
+        await update.message.reply_text(f"✅ Destination: {fwd.title} ({fwd.id})", reply_markup=channel_kb())
+
+
+# ═══ Main ═══
 async def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("optin", optin))
+    app.add_handler(CommandHandler("optout", optout))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    app.add_handler(MessageHandler(filters.FORWARD, handle_forward))
+    app.add_handler(MessageHandler(filters.ALL & filters.ChatType.GROUPS, handle_group))
 
-    print("🤖 অ্যাডমিন বট চালু হয়েছে")
+    print("🤖 অ্যাডমিন বট চালু হয়েছে!")
 
-    # userbot চালু (session থাকলে)
+    # userbot চেষ্টা
     try:
         from userbot import user_client
         if user_client:
-            from config import SESSION, PHONE
             await user_client.start(phone=PHONE)
             me = await user_client.get_me()
             print(f"👀 Userbot: {me.first_name} ({me.id})")
-            sources = settings.get("sources", [])
-            print(f"👀 {len(sources)} সোর্স চ্যানেল")
     except Exception as e:
         print(f"⚠️ Userbot চালু হচ্ছে না: {e}")
 
