@@ -21,11 +21,17 @@ def _request(payload: dict, api_key: str) -> str:
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; NishatXBot/1.0; +https://railway.app)",
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=45) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:300]
+        raise urllib.error.HTTPError(error.url, error.code, f"{error.reason} — {detail}", error.headers, None)
     return data["choices"][0]["message"]["content"].strip()
 
 
