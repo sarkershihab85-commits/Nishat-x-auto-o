@@ -8,6 +8,20 @@ from config import DATA_DIR
 SETTINGS_FILE = DATA_DIR / "settings.json"
 PROCESSED_FILE = DATA_DIR / "processed_posts.log"
 
+CURRENT_AI_MODEL = "openai/gpt-oss-120b"
+# Groq decommissions old model IDs from time to time. Anything saved in an
+# older settings.json under these names gets auto-migrated to
+# CURRENT_AI_MODEL on load, so a stale deployment doesn't keep failing.
+DEPRECATED_AI_MODELS = {
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "qwen/qwen3-32b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "deepseek-r1-distill-llama-70b",
+}
+
 DEFAULT_SETTINGS = {
     "autopost": True,
     "delay_minutes": 0,
@@ -33,12 +47,25 @@ DEFAULT_SETTINGS = {
         "custom_prompt": "",
         "length": "মূল পোস্টের কাছাকাছি",
         "emoji": True,
-        "model": "openai/gpt-oss-120b",
+        "model": CURRENT_AI_MODEL,
         "identity_name": "",
         "owner_name": "",
         "identity_filter": "",
         "master_instruction": "",
+        "private_knowledge": "",
     },
+    "live_chat": {
+        "enabled": False,
+        "style": "বন্ধুত্বপূর্ণ ও সহায়ক",
+        "custom_prompt": "",
+        "answer_length": "মাঝারি",
+        "context_enabled": True,
+    },
+    "welcome": {
+        "enabled": False,
+        "message": "স্বাগতম {name}! 🎉",
+    },
+    "word_filters": [],
     "users": {},
     "user_campaign": {
         "message": "",
@@ -79,6 +106,9 @@ def load_settings() -> dict:
         settings = _merge(DEFAULT_SETTINGS, current)
         if legacy_destination and not current.get("destinations"):
             settings["destinations"] = [legacy_destination]
+        if settings.get("ai", {}).get("model") in DEPRECATED_AI_MODELS:
+            settings["ai"]["model"] = CURRENT_AI_MODEL
+            save_settings(settings)
         return settings
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return deepcopy(DEFAULT_SETTINGS)
