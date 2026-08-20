@@ -1,19 +1,29 @@
+# config.py — প্রজেক্ট কনফিগারেশন ও এনভায়রনমেন্ট ভ্যারিয়েবল ফাইল
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+
+# .env ফাইল লোড করা
 load_dotenv()
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+# Project Directories Configuration
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
-API_ID = int(os.getenv("TELEGRAM_API_ID") or "0")
-API_HASH = os.getenv("TELEGRAM_API_HASH")
-_session = os.getenv("TELEGRAM_SESSION", "telegram_user")
-SESSION = _session if os.path.isabs(_session) else str(DATA_DIR / _session)
-PHONE = os.getenv("TELEGRAM_PHONE")
-DELAY_MINUTES = int(os.getenv("DELAY_MINUTES") or "0")
-TEMPLATE_HEADER = os.getenv("TEMPLATE_HEADER", "")
-TEMPLATE_FOOTER = os.getenv("TEMPLATE_FOOTER", "")
-EMOJI_EDITING = os.getenv("EMOJI_EDITING", "true").lower() in ("1", "true", "yes", "on")
+SETTINGS_FILE = DATA_DIR / "settings.json"
+
+# Telegram Bot Token & Admin Setup
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+
+# Primary Admin List (Environment Variable থেকে নিয়ে Integer-এ রূপান্তর)
+raw_admins = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(a.strip()) for a in raw_admins.split(",") if a.strip().isdigit()]
+
+# Userbot (Personal Account) Pyrogram/Telethon Credentials
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")
+
+# AI Engine Configuration
+AI_API_KEY = os.getenv("AI_API_KEY", "")
