@@ -125,12 +125,22 @@ def apply_template(text: str, template: dict) -> str:
     return "\n\n".join(parts)
 
 
+def apply_word_filters(text: str, word_filters: list) -> str:
+    """Simple literal find→replace list, admin-configured (⚙️ AI সেটিংস → 🔤 Word Filter)."""
+    for item in word_filters or []:
+        find = (item or {}).get("find", "")
+        if find:
+            text = text.replace(find, (item or {}).get("replace", ""))
+    return text
+
+
 async def prepare_text(text: str, settings: dict) -> str:
     text = clean_personal(
         text,
         settings.get("privacy"),
         settings.get("replacements"),
     )
+    text = apply_word_filters(text, settings.get("word_filters", []))
     ai = settings.get("ai", {})
     if ai.get("enabled") and text:
         try:
