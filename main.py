@@ -863,7 +863,7 @@ def main():
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forward))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_group))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle))
-    print("🤖 অ্যাডমিন বট চালু হয়েছে")
+    print("🚀 Nishat X পোস্ট বট চালু হয়েছে ✅")
     app.run_polling()
 
 if __name__ == "__main__":
