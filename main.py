@@ -264,7 +264,9 @@ async def campaign_loop(application):
 
 async def post_init(application):
     import asyncio
-    application.create_task(campaign_loop(application))
+    async def post_init(application):
+    import asyncio
+    asyncio.create_task(campaign_loop(application))
 
 # ═══ হ্যান্ডলার ═══
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
