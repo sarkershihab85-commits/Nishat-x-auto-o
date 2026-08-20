@@ -262,11 +262,7 @@ async def campaign_loop(application):
             save_settings(settings)
 
 
-async def post_init(application):
-    import asyncio
-    async def post_init(application):
-    import asyncio
-    asyncio.create_task(campaign_loop(application))
+asyncio.create_task(campaign_loop(application))
 
 # ═══ হ্যান্ডলার ═══
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
