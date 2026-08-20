@@ -16,6 +16,20 @@ from ai_client import answer_group_message
 settings = load_settings()
 my_channels = {}
 user_state = {}   # {user_id: {"step": ..., "type": ...}}
+live_chat_history = {}   # {user_id: [last few "User: ..." / "AI: ..." lines]} — in-memory only
+
+
+def base_ai_context() -> dict:
+    """Shared AI identity + master rules + private knowledge, used by both
+    Group AI replies and private Live Chat replies."""
+    ai = settings.get("ai", {})
+    return {
+        "identity_name": ai.get("identity_name", ""),
+        "owner_name": ai.get("owner_name", ""),
+        "identity_filter": ai.get("identity_filter", ""),
+        "master_instruction": ai.get("master_instruction", ""),
+        "private_knowledge": ai.get("private_knowledge", ""),
+    }
 
 # ═══ ফাইল-ভিত্তিক স্টেট ও স্ট্যাটস (আসল, কাজ করে) ═══
 def set_autopost(on: bool):
@@ -79,8 +93,35 @@ def ai_kb():
         ["🎨 AI Style", "🧠 Custom Prompt"],
         ["📏 Post Length", "✨ AI Emoji ON/OFF"],
         ["🎭 AI পরিচয় সেটিংস"],
-        ["👥 Group AI সেটিংস"],
+        ["👥 Group AI সেটিংস", "💬 Live Chat সেটিংস"],
+        ["📚 Private Knowledge", "👋 Welcome সেটিংস"],
+        ["🔤 Word Filter"],
         ["⬅️ ফিরে যান"],
+    ], resize_keyboard=True)
+
+
+def live_chat_kb():
+    return ReplyKeyboardMarkup([
+        ["🟢 Live Chat চালু", "🔴 Live Chat বন্ধ"],
+        ["🎨 Chat Style", "🧠 Chat Prompt"],
+        ["🔁 Context ON/OFF"],
+        ["⬅️ AI সেটিংসে ফিরুন"],
+    ], resize_keyboard=True)
+
+
+def welcome_kb():
+    return ReplyKeyboardMarkup([
+        ["🟢 Welcome চালু", "🔴 Welcome বন্ধ"],
+        ["✏️ Welcome বার্তা"],
+        ["⬅️ AI সেটিংসে ফিরুন"],
+    ], resize_keyboard=True)
+
+
+def word_filter_kb():
+    return ReplyKeyboardMarkup([
+        ["➕ Filter যোগ", "➖ Filter বাদ"],
+        ["📋 Filter তালিকা"],
+        ["⬅️ AI সেটিংসে ফিরুন"],
     ], resize_keyboard=True)
 
 
@@ -236,13 +277,7 @@ async def handle_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if mode == "ask":
         text = text[4:].strip()
-    identity = {
-        "identity_name": settings.get("ai", {}).get("identity_name", ""),
-        "owner_name": settings.get("ai", {}).get("owner_name", ""),
-        "identity_filter": settings.get("ai", {}).get("identity_filter", ""),
-        "master_instruction": settings.get("ai", {}).get("master_instruction", ""),
-    }
-    group_context = {**identity, **group}
+    group_context = {**base_ai_context(), **group}
     try:
         answer = await answer_group_message(text, group_context, "")
         await message.reply_text(answer[:4000], disable_web_page_preview=True)
@@ -251,6 +286,52 @@ async def handle_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("⚠️ AI উত্তর দিতে পারেনি। কিছুক্ষণ পর আবার চেষ্টা করুন।")
         with open(DATA_DIR / "ai_errors.log", "a", encoding="utf-8") as file:
             file.write(f"group={chat_id} error={error}\n")
+
+
+async def handle_user_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Live AI Chat for regular (non-admin) users in private messages."""
+    live = settings.get("live_chat", {})
+    if not live.get("enabled"):
+        await update.message.reply_text("❌ অনুমতি নেই।")
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    uid = update.effective_user.id
+    history_list = live_chat_history.setdefault(uid, [])
+    context_text = "\n".join(history_list[-6:]) if live.get("context_enabled", True) else ""
+    chat_context = {**base_ai_context(), **live}
+    try:
+        answer = await answer_group_message(text, chat_context, context_text)
+    except Exception as error:
+        print(f"⚠️ Live chat AI error uid={uid}: {repr(error)}", flush=True)
+        await update.message.reply_text("⚠️ এই মুহূর্তে উত্তর দেওয়া যাচ্ছে না। একটু পর আবার চেষ্টা করুন।")
+        with open(DATA_DIR / "ai_errors.log", "a", encoding="utf-8") as file:
+            file.write(f"live_chat uid={uid} error={error}\n")
+        return
+    await update.message.reply_text(answer[:4000], disable_web_page_preview=True)
+    history_list.append(f"User: {text}")
+    history_list.append(f"AI: {answer}")
+    live_chat_history[uid] = history_list[-12:]
+
+
+async def handle_new_members(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """👋 Welcome System — greets new members joining a group the bot is in."""
+    welcome = settings.get("welcome", {})
+    if not welcome.get("enabled"):
+        return
+    message = update.message
+    if not message or not message.new_chat_members:
+        return
+    template = welcome.get("message") or "স্বাগতম {name}! 🎉"
+    for member in message.new_chat_members:
+        if member.id == ctx.bot.id:
+            continue
+        name = member.full_name or member.first_name or "বন্ধু"
+        try:
+            await ctx.bot.send_message(chat_id=update.effective_chat.id, text=template.replace("{name}", name))
+        except Exception as error:
+            print(f"⚠️ Welcome message failed: {error}")
 
 
 async def send_campaign(bot):
@@ -317,7 +398,8 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
         return
-    if user_state.get(uid, {}).get("step") != "await_master_instruction":
+    step = user_state.get(uid, {}).get("step")
+    if step not in ("await_master_instruction", "await_private_knowledge"):
         return
     doc = update.message.document
     if not doc:
@@ -335,19 +417,23 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not content:
         await update.message.reply_text("⚠️ ফাইলটা খালি মনে হচ্ছে।")
         return
-    settings["ai"]["master_instruction"] = content[:8000]
+    field = "master_instruction" if step == "await_master_instruction" else "private_knowledge"
+    label = "Master নির্দেশনা" if field == "master_instruction" else "Private Knowledge"
+    kb = ai_identity_kb() if field == "master_instruction" else ai_kb()
+    settings["ai"][field] = content[:8000]
     save_settings(settings)
     user_state.pop(uid, None)
     await update.message.reply_text(
-        f"✅ ফাইল থেকে Master নির্দেশনা সেভ হয়েছে ({len(content)} অক্ষর)। AI এখন থেকে এই নিয়ম মেনে চলবে।",
-        reply_markup=ai_identity_kb())
+        f"✅ ফাইল থেকে {label} সেভ হয়েছে ({len(content)} অক্ষর)। AI এখন থেকে এই তথ্য/নিয়ম মেনে চলবে।",
+        reply_markup=kb)
 
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     t = update.message.text
     uid = update.effective_user.id
     if not is_admin(uid):
-        await update.message.reply_text("❌ অনুমতি নেই।"); return
+        await handle_user_chat(update, ctx)
+        return
 
     if uid in user_state and user_state[uid]["step"] == "await_campaign_message":
         settings["user_campaign"]["message"] = t
@@ -396,6 +482,62 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "✅ Master নির্দেশনা সেভ হয়েছে। AI এখন থেকে এই নিয়ম মেনে সব জায়গায় কাজ করবে।",
             reply_markup=ai_identity_kb())
+        return
+
+    if uid in user_state and user_state[uid]["step"] == "await_private_knowledge":
+        if t.strip() in ("না", "-", "খালি"):
+            settings["ai"]["private_knowledge"] = ""
+        else:
+            settings["ai"]["private_knowledge"] = t.strip()[:8000]
+        save_settings(settings)
+        user_state.pop(uid, None)
+        await update.message.reply_text(
+            "✅ Private Knowledge সেভ হয়েছে। Group AI ও Live Chat উত্তরের সময় প্রয়োজনে এই তথ্য ব্যবহার করবে।",
+            reply_markup=ai_kb())
+        return
+
+    if uid in user_state and user_state[uid]["step"] == "await_live_chat_field":
+        field = user_state[uid]["field"]
+        lc = settings.setdefault("live_chat", {})
+        lc[field] = "" if t.strip() in ("না", "-", "খালি") else t.strip()
+        save_settings(settings)
+        user_state.pop(uid, None)
+        await update.message.reply_text("✅ Live Chat সেটিংস সেভ হয়েছে।", reply_markup=live_chat_kb())
+        return
+
+    if uid in user_state and user_state[uid]["step"] == "await_welcome_message":
+        welcome = settings.setdefault("welcome", {})
+        welcome["message"] = "" if t.strip() in ("না", "-", "খালি") else t.strip()
+        save_settings(settings)
+        user_state.pop(uid, None)
+        await update.message.reply_text("✅ Welcome বার্তা সেভ হয়েছে।", reply_markup=welcome_kb())
+        return
+
+    if uid in user_state and user_state[uid]["step"] == "await_word_filter_add":
+        if "=>" not in t:
+            await update.message.reply_text("⚠️ Format ভুল। উদাহরণ: পুরনো_শব্দ => নতুন_শব্দ")
+            return
+        find_part, replace_part = t.split("=>", 1)
+        find_part, replace_part = find_part.strip(), replace_part.strip()
+        if not find_part:
+            await update.message.reply_text("⚠️ খুঁজবে অংশ খালি রাখা যাবে না।")
+            return
+        settings.setdefault("word_filters", []).append({"find": find_part, "replace": replace_part})
+        save_settings(settings)
+        user_state.pop(uid, None)
+        await update.message.reply_text("✅ Filter যোগ হয়েছে।", reply_markup=word_filter_kb())
+        return
+
+    if uid in user_state and user_state[uid]["step"] == "await_word_filter_remove":
+        filters_list = settings.get("word_filters", [])
+        value = t.strip()
+        if not value.isdigit() or not (1 <= int(value) <= len(filters_list)):
+            await update.message.reply_text("⚠️ 📋 Filter তালিকা থেকে সঠিক নম্বর লিখুন।")
+            return
+        removed = filters_list.pop(int(value) - 1)
+        save_settings(settings)
+        user_state.pop(uid, None)
+        await update.message.reply_text(f"✅ বাদ দেওয়া হয়েছে: {removed['find']}", reply_markup=word_filter_kb())
         return
 
     if uid in user_state and user_state[uid]["step"] == "await_users":
@@ -774,6 +916,86 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Mode: always / question / mention / reply / ask\n"
             "উদাহরণ: -100123456789 on mention", reply_markup=ai_kb())
 
+    elif t == "💬 Live Chat সেটিংস":
+        live = settings.setdefault("live_chat", {})
+        await update.message.reply_text(
+            f"💬 Live AI Chat (private DM)\n\n"
+            f"অবস্থা: {'🟢 চালু' if live.get('enabled') else '🔴 বন্ধ'}\n"
+            f"Style: {live.get('style') or '(default)'}\n"
+            f"Context (আগের কথা মনে রাখা): {'🟢 ON' if live.get('context_enabled', True) else '🔴 OFF'}\n"
+            f"Custom prompt: {live.get('custom_prompt') or '(খালি)'}\n\n"
+            f"চালু থাকলে সাধারণ user private message পাঠালে AI সরাসরি উত্তর দেবে।",
+            reply_markup=live_chat_kb())
+
+    elif t in ("🟢 Live Chat চালু", "🔴 Live Chat বন্ধ"):
+        settings.setdefault("live_chat", {})["enabled"] = t.startswith("🟢")
+        save_settings(settings)
+        await update.message.reply_text("✅ Live Chat অবস্থা আপডেট হয়েছে।", reply_markup=live_chat_kb())
+
+    elif t in ("🎨 Chat Style", "🧠 Chat Prompt"):
+        field = "style" if t == "🎨 Chat Style" else "custom_prompt"
+        user_state[uid] = {"step": "await_live_chat_field", "field": field}
+        await update.message.reply_text("নতুন মান লিখুন। খালি করতে 'না' লিখুন।")
+
+    elif t == "🔁 Context ON/OFF":
+        lc = settings.setdefault("live_chat", {})
+        lc["context_enabled"] = not lc.get("context_enabled", True)
+        save_settings(settings)
+        await update.message.reply_text("✅ Context সেটিংস আপডেট হয়েছে।", reply_markup=live_chat_kb())
+
+    elif t == "📚 Private Knowledge":
+        knowledge = settings.get("ai", {}).get("private_knowledge", "")
+        preview = (knowledge[:300] + "...") if len(knowledge) > 300 else (knowledge or "(খালি)")
+        user_state[uid] = {"step": "await_private_knowledge"}
+        await update.message.reply_text(
+            f"📚 বর্তমান Private Knowledge:\n{preview}\n\n"
+            "AI যেন জানে এমন তথ্য (FAQ, product info, নিয়মকানুন ইত্যাদি) লিখে পাঠান, "
+            "অথবা .txt ফাইল পাঠান। খালি করতে 'না' লিখুন।\n"
+            "⚠️ Password/Token/API Key এখানে যোগ করবেন না।")
+
+    elif t == "👋 Welcome সেটিংস":
+        welcome = settings.setdefault("welcome", {})
+        await update.message.reply_text(
+            f"👋 Welcome System (Group-এ নতুন member Join)\n\n"
+            f"অবস্থা: {'🟢 চালু' if welcome.get('enabled') else '🔴 বন্ধ'}\n"
+            f"বার্তা: {welcome.get('message') or '(default)'}\n\n"
+            f"{{name}} লিখলে নতুন member-এর নাম বসবে।",
+            reply_markup=welcome_kb())
+
+    elif t in ("🟢 Welcome চালু", "🔴 Welcome বন্ধ"):
+        settings.setdefault("welcome", {})["enabled"] = t.startswith("🟢")
+        save_settings(settings)
+        await update.message.reply_text("✅ Welcome অবস্থা আপডেট হয়েছে।", reply_markup=welcome_kb())
+
+    elif t == "✏️ Welcome বার্তা":
+        user_state[uid] = {"step": "await_welcome_message"}
+        await update.message.reply_text("Welcome বার্তা লিখুন। {name} দিয়ে user-এর নাম বসবে। খালি করতে 'না' লিখুন।")
+
+    elif t == "🔤 Word Filter":
+        filters_list = settings.get("word_filters", [])
+        rows = [f"{i+1}. {f['find']} → {f['replace'] or '(খালি)'}" for i, f in enumerate(filters_list)]
+        await update.message.reply_text(
+            "🔤 Word Filter/Replace (Auto Post editing-এ প্রযোজ্য)\n\n" + ("\n".join(rows) if rows else "তালিকা খালি।"),
+            reply_markup=word_filter_kb())
+
+    elif t == "➕ Filter যোগ":
+        user_state[uid] = {"step": "await_word_filter_add"}
+        await update.message.reply_text("Format: পুরনো_শব্দ => নতুন_শব্দ\nউদাহরণ: cheap => affordable")
+
+    elif t == "➖ Filter বাদ":
+        filters_list = settings.get("word_filters", [])
+        if not filters_list:
+            await update.message.reply_text("তালিকা খালি।", reply_markup=word_filter_kb())
+        else:
+            rows = [f"{i+1}. {f['find']} → {f['replace'] or '(খালি)'}" for i, f in enumerate(filters_list)]
+            user_state[uid] = {"step": "await_word_filter_remove"}
+            await update.message.reply_text("যে নম্বরটা বাদ দিতে চান তা লিখুন:\n\n" + "\n".join(rows))
+
+    elif t == "📋 Filter তালিকা":
+        filters_list = settings.get("word_filters", [])
+        rows = [f"{i+1}. {f['find']} → {f['replace'] or '(খালি)'}" for i, f in enumerate(filters_list)]
+        await update.message.reply_text("\n".join(rows) or "তালিকা খালি।", reply_markup=word_filter_kb())
+
     elif t in ("🎭 AI পরিচয় সেটিংস", "⬅️ AI সেটিংসে ফিরুন"):
         if t == "⬅️ AI সেটিংসে ফিরুন":
             await update.message.reply_text("🤖 AI সেটিংসে ফিরে গেলাম।", reply_markup=ai_kb())
@@ -980,6 +1202,7 @@ def main():
         app.add_handler(CommandHandler(command, manage_user))
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forward))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_document))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_members))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_group))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle))
     print(r"""
