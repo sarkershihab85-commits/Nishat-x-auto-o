@@ -1,134 +1,69 @@
 import json
-import os
-from copy import deepcopy
 from pathlib import Path
-
 from config import DATA_DIR
 
 SETTINGS_FILE = DATA_DIR / "settings.json"
-PROCESSED_FILE = DATA_DIR / "processed_posts.log"
 
-CURRENT_AI_MODEL = "openai/gpt-oss-120b"
-# Groq decommissions old model IDs from time to time. Anything saved in an
-# older settings.json under these names gets auto-migrated to
-# CURRENT_AI_MODEL on load, so a stale deployment doesn't keep failing.
-DEPRECATED_AI_MODELS = {
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "llama3-70b-8192",
-    "llama3-8b-8192",
-    "qwen/qwen3-32b",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "deepseek-r1-distill-llama-70b",
-}
-
-DEFAULT_SETTINGS = {
-    "autopost": True,
-    "delay_minutes": 0,
-    "template": {"header": "", "footer": ""},
+DEFAULT = {
     "sources": [],
     "destinations": [],
-    "forward_groups": [],
+    "delay_minutes": 0,
+    "autopost": False,
+    "template": {"header": "", "footer": ""},
+    "privacy": {
+        "username": {"on": True},
+        "phone": {"on": True},
+        "email": {"on": True},
+        "tme_link": {"on": True},
+    },
+    "replacements": {
+        "contact": "@FastOTP_Nishat",
+    },
     "forwarding": {
         "enabled": False,
         "repeat_count": 1,
         "repeat_interval_minutes": 0,
     },
-    "replacements": {
-        "username": "",
-        "phone": "",
-        "email": "",
-        "tme_link": "",
-    },
-    "emoji_editing": True,
     "ai": {
         "enabled": False,
-        "style": "পরিষ্কার, স্বাভাবিক ও পেশাদার",
-        "custom_prompt": "",
-        "length": "মূল পোস্টের কাছাকাছি",
+        "style": "সহায়ক, ভদ্র ও সংক্ষিপ্ত",
+        "length": "মাঝারি",
         "emoji": True,
-        "model": CURRENT_AI_MODEL,
-        "identity_name": "",
-        "owner_name": "",
-        "identity_filter": "",
-        "master_instruction": "",
-        "private_knowledge": "",
-    },
-    "live_chat": {
-        "enabled": False,
-        "style": "বন্ধুত্বপূর্ণ ও সহায়ক",
         "custom_prompt": "",
-        "answer_length": "মাঝারি",
-        "context_enabled": True,
     },
-    "welcome": {
-        "enabled": False,
-        "message": "স্বাগতম {name}! 🎉",
-    },
-    "word_filters": [],
     "users": {},
     "user_campaign": {
-        "message": "",
-        "user_ids": [],
-        "delay_minutes": 0,
         "enabled": False,
+        "user_ids": [],
+        "message": "",
+        "delay_minutes": 0,
     },
     "group_ai": {},
+    "forward_groups": [],
     "channel_group_forwarding": {
         "enabled": False,
-        "selected_group": "",
         "groups": {},
-    },
-    "privacy": {
-        "username": {"on": True},
-        "tme_link": {"on": True},
-        "phone": {"on": True},
-        "email": {"on": True},
-        "user_id": {"on": False},
+        "selected_group": None,
     },
 }
 
 
-def _merge(default, current):
-    if isinstance(default, dict):
-        result = {}
-        for key, value in default.items():
-            result[key] = _merge(value, current.get(key) if isinstance(current, dict) else None)
-        return result
-    return current if current is not None else default
+def load_settings():
+    if SETTINGS_FILE.exists():
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            # missing keys fill from DEFAULT
+            for key, val in DEFAULT.items():
+                if key not in data:
+                    data[key] = val
+            return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return json.loads(json.dumps(DEFAULT))
 
 
-def load_settings() -> dict:
-    try:
-        with SETTINGS_FILE.open(encoding="utf-8") as file:
-            current = json.load(file)
-        legacy_destination = current.get("destination_channel_id")
-        settings = _merge(DEFAULT_SETTINGS, current)
-        if legacy_destination and not current.get("destinations"):
-            settings["destinations"] = [legacy_destination]
-        if settings.get("ai", {}).get("model") in DEPRECATED_AI_MODELS:
-            settings["ai"]["model"] = CURRENT_AI_MODEL
-            save_settings(settings)
-        return settings
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return deepcopy(DEFAULT_SETTINGS)
-
-
-def save_settings(settings: dict) -> None:
-    temporary = SETTINGS_FILE.with_suffix(".tmp")
-    with temporary.open("w", encoding="utf-8") as file:
-        json.dump(settings, file, ensure_ascii=False, indent=2)
-    os.replace(temporary, SETTINGS_FILE)
-
-
-def is_processed(post_key: str) -> bool:
-    try:
-        with PROCESSED_FILE.open(encoding="utf-8") as file:
-            return post_key in {line.strip() for line in file}
-    except FileNotFoundError:
-        return False
-
-
-def mark_processed(post_key: str) -> None:
-    with PROCESSED_FILE.open("a", encoding="utf-8") as file:
-        file.write(post_key + "\n")
+def save_settings(data):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
