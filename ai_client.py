@@ -1,169 +1,138 @@
-"""Small Groq REST client with safe fallback behavior.
+# ai_client.py — AI এডিটিং, প্রাইভেস ফিল্টারিং ও অটো-নোটিফিকেশন মডিউল
+import re
+import traceback
+from pathlib import Path
+from telegram.ext import Application
+import google.generativeai as genai
 
-The key is read only from the GROQ_API_KEY environment variable.  No key is
-stored in settings.json or written to logs.
-"""
-import asyncio
-import json
-import os
-import urllib.error
-import urllib.request
+from config import AI_API_KEY, ADMIN_IDS
+from settings_store import load_settings
 
-
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-# Groq periodically deprecates/decommissions older model IDs. This is the
-# safe, currently-supported model we fall back to if the configured model
-# in settings.json is no longer valid (HTTP 404 model_not_found), so old
-# deployments don't silently break. Keep in sync with settings_store's
-# DEPRECATED_MODEL_MIGRATIONS default target.
-FALLBACK_MODEL = "openai/gpt-oss-120b"
+# Gemini API Initialization
+if AI_API_KEY:
+    genai.configure(api_key=AI_API_KEY)
 
 
-def _request(payload: dict, api_key: str) -> str:
-    body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        GROQ_URL,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (compatible; NishatXBot/1.0; +https://railway.app)",
-        },
-        method="POST",
+def apply_privacy_filters(text: str, settings: dict) -> str:
+    """লোকাল টেক্সট ফিল্টারিং: ফোন, ইমেইল, লিঙ্ক, ইউজারনেম ও ওয়ার্ড রিপ্লেসমেন্ট"""
+    privacy = settings.get("privacy", {})
+
+    # Phone Filter
+    if privacy.get("phone", True):
+        text = re.sub(r'(\+?88)?01[3-9]\d{8}', '[Phone Removed]', text)
+
+    # Email Filter
+    if privacy.get("email", True):
+        text = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '[Email Removed]', text)
+
+    # Link Filter
+    if privacy.get("links", True):
+        text = re.sub(r'https?://\S+|www\.\S+', '[Link Removed]', text)
+
+    # Username Filter
+    if privacy.get("usernames", True):
+        text = re.sub(r'@[a-zA-Z0-9_]+', '[Username Removed]', text)
+
+    # Custom Word Filters Replacement
+    for wf in settings.get("word_filters", []):
+        find_word = wf.get("find", "")
+        replace_word = wf.get("replace", "")
+        if find_word:
+            text = text.replace(find_word, replace_word)
+
+    return text
+
+
+async def edit_post_with_ai(original_text: str, settings: dict, bot_app: Application = None) -> str:
+    """AI এর মাধ্যমে পোস্ট রিরাইট ও স্মার্ট ফরম্যাটিং"""
+    ai_config = settings.get("ai", {})
+
+    # ১. প্রাইভেসি ফিল্টার প্রয়োগ
+    clean_text = apply_privacy_filters(original_text, settings)
+
+    # AI বন্ধ থাকলে প্রাইভেসি ক্লিন করা টেক্সটই রিটার্ন হবে
+    if not ai_config.get("enabled", True) or not AI_API_KEY:
+        return clean_text
+
+    # ২. AI System Prompt তৈরি
+    custom_prompt = ai_config.get("custom_prompt", "")
+    identity = ai_config.get("identity_name", "")
+    owner = ai_config.get("owner_name", "")
+    master_inst = ai_config.get("master_instruction", "")
+
+    system_instruction = (
+        f"You are an expert Telegram content editor for {identity or 'our channel'}.\n"
+        f"Owner/Brand: {owner}\n"
+        f"Master Instruction: {master_inst}\n"
+        f"Custom Instruction: {custom_prompt}\n"
+        "Task: Rewrite, format cleanly, remove promotional fluff, add engaging bullet points and suitable emojis. "
+        "Keep the core message clear and professional. Do NOT invent fake information."
     )
+
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")[:300]
-        raise urllib.error.HTTPError(error.url, error.code, f"{error.reason} — {detail}", error.headers, None)
-    return data["choices"][0]["message"]["content"].strip()
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        full_prompt = f"{system_instruction}\n\nOriginal Post:\n{clean_text}"
+        response = model.generate_content(full_prompt)
+
+        if response and response.text:
+            return response.text.strip()
+        return clean_text
+
+    except Exception as err:
+        err_msg = f"AI Generation Failed: {str(err)}"
+        print(f"⚠️ {err_msg}")
+        
+        # নোটিফিকেশন সিস্টেম
+        if bot_app:
+            await notify_admin_error(
+                bot_app=bot_app,
+                error_title="AI Processing Error",
+                error_details=err_msg,
+                solutions=["API Key মেয়াদ বা লিমিট চেক করুন", "Gemini Service স্ট্যাটাস দেখুন"],
+                error_code="AI_EDIT_ERR"
+            )
+        return clean_text
 
 
-async def ask_groq(
-    prompt: str,
-    *,
-    system: str,
-    model: str = FALLBACK_MODEL,
-    max_tokens: int = 900,
-) -> str:
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY সেট করা নেই")
-    payload_base = {
-        "temperature": 0.35,
-        "max_tokens": max(100, min(max_tokens, 1800)),
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-    }
-    # Try the configured model first; if Groq says it no longer exists
-    # (deprecated/decommissioned), fall back to FALLBACK_MODEL automatically
-    # instead of failing the whole request.
-    models_to_try = [model] if model == FALLBACK_MODEL else [model, FALLBACK_MODEL]
-    last_error = None
-    for candidate_model in models_to_try:
-        payload = {**payload_base, "model": candidate_model}
-        for attempt in range(2):
-            try:
-                return await asyncio.to_thread(_request, payload, api_key)
-            except urllib.error.HTTPError as error:
-                last_error = error
-                if error.code == 404:
-                    break  # unknown/deprecated model — stop retrying this one, try next candidate
-                if attempt == 0:
-                    await asyncio.sleep(1)
-            except (urllib.error.URLError, KeyError, ValueError) as error:
-                last_error = error
-                if attempt == 0:
-                    await asyncio.sleep(1)
-    raise RuntimeError(f"Groq request failed: {last_error}")
-
-
-
-
-def _identity_instructions(ai: dict) -> str:
-    """Build a system-prompt block enforcing a custom AI identity/owner and
-    hiding the real model/provider name. Fully configurable from the admin
-    panel via settings['ai']['identity_name' / 'owner_name' / 'identity_filter']."""
-    name = (ai.get("identity_name") or "").strip()
-    owner = (ai.get("owner_name") or "").strip()
-    extra = (ai.get("identity_filter") or "").strip()
-    parts = []
-    if name:
-        parts.append(
-            f"তুমি নিজের নাম/পরিচয় হিসেবে সবসময় '{name}' ব্যবহার করবে। "
-            "তুমি কখনো ChatGPT, OpenAI, GPT, Groq, Llama, Meta, বা অন্য কোনো "
-            "company/model-এর নাম নিজের পরিচয় হিসেবে বলবে না, উল্লেখও করবে না।"
-        )
-    else:
-        parts.append(
-            "তুমি কখনো ChatGPT, OpenAI, GPT, Groq, Llama, Meta, বা তোমাকে কে "
-            "বানিয়েছে সেই company/model-এর নাম প্রকাশ করবে না।"
-        )
-    if owner:
-        parts.append(f"কেউ তোমার মালিক/owner/creator/developer কে জিজ্ঞেস করলে বলবে: '{owner}'।")
-    else:
-        parts.append("কেউ তোমার মালিক/owner/creator জিজ্ঞেস করলে ব্যক্তিগত তথ্য না দিয়ে সংক্ষেপে এড়িয়ে যাবে।")
-    if extra:
-        parts.append(f"অতিরিক্ত নিয়ম (admin-সেট করা): {extra}")
-    return " ".join(parts)
-
-
-def _knowledge_block(ai: dict) -> str:
-    """Admin-provided reference info (FAQ, product details, rules, etc.) that
-    the AI may draw on when answering. settings['ai']['private_knowledge']."""
-    text = (ai.get("private_knowledge") or "").strip()
-    if not text:
+async def answer_group_message(user_query: str, settings: dict) -> str:
+    """গ্রুপের প্রশ্নের জন্য AI অটো-রিপ্লাই"""
+    if not AI_API_KEY:
         return ""
-    return (
-        "\n\n=== অনুমোদিত তথ্য (শুধু প্রাসঙ্গিক প্রশ্নে ব্যবহার করুন) ===\n"
-        f"{text}\n"
-        "এই তথ্যের মধ্যে কোনো password, token, API key বা অন্য গোপনীয় কিছু থাকলে "
-        "তা কখনো প্রকাশ করবেন না।\n=== তথ্য শেষ ===\n"
+
+    ai_config = settings.get("ai", {})
+    knowledge = ai_config.get("private_knowledge", "")
+
+    prompt = (
+        f"Context/Knowledge: {knowledge}\n"
+        f"User Question: {user_query}\n"
+        "Answer politely, concisely, and accurately in Bengali or English based on the input."
     )
 
-
-def _master_block(ai: dict) -> str:
-    """A free-form rulebook the admin writes (by text or .txt upload) that the
-    AI must follow above everything else. settings['ai']['master_instruction']."""
-    text = (ai.get("master_instruction") or "").strip()
-    if not text:
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(prompt)
+        return response.text.strip() if response and response.text else ""
+    except Exception:
         return ""
-    return f"\n\n=== সর্বোচ্চ অগ্রাধিকার নির্দেশনা (admin-এর দেওয়া, সবসময় মেনে চলবে) ===\n{text}\n=== নির্দেশনা শেষ ===\n"
 
 
-async def edit_post_with_ai(text: str, settings: dict) -> str:
-    ai = settings.get("ai", {})
-    style = ai.get("style") or "পরিষ্কার, স্বাভাবিক ও পেশাদার"
-    length = ai.get("length") or "মূল পোস্টের কাছাকাছি"
-    emoji = "প্রয়োজনে অল্প emoji ব্যবহার করুন" if ai.get("emoji", True) else "কোনো emoji ব্যবহার করবেন না"
-    custom = ai.get("custom_prompt") or "কোনো অতিরিক্ত নির্দেশ নেই"
-    system = (
-        "আপনি Telegram পোস্ট সম্পাদক। মূল তথ্য, সংখ্যা, নাম, লিংক ও অর্থ পরিবর্তন করবেন না। "
-        "অপ্রয়োজনীয় call-to-action, বিজ্ঞাপন বা নতুন তথ্য যোগ করবেন না। একই ভাষায় লিখুন। "
-        f"Style: {style}. Length: {length}. {emoji}. Custom instruction: {custom}. "
-        "শুধু সম্পাদিত পোস্টটি ফেরত দিন, কোনো ব্যাখ্যা নয়।"
-        f"{_master_block(ai)}"
+async def notify_admin_error(bot_app: Application, error_title: str, error_details: str, solutions: list, error_code: str):
+    """যেকোনো ত্রুটি অ্যাডমিনকে নোটিফিকেশন আকারে পাঠানোর সিস্টেম"""
+    sol_text = "\n".join([f"• {s}" for s in solutions])
+    
+    message = (
+        f"🚨 **System Alert: {error_title}**\n\n"
+        f"⚠️ **Error Code:** `{error_code}`\n"
+        f"📝 **Details:** {error_details}\n\n"
+        f"💡 **Suggested Fixes:**\n{sol_text}"
     )
-    return await ask_groq(f"এই পোস্টটি সম্পাদনা করুন:\n\n{text}", system=system, model=ai.get("model", "openai/gpt-oss-120b"))
 
+    settings = load_settings()
+    configured_admins = settings.get("multi_admins", [])
+    all_admins = set(ADMIN_IDS + configured_admins)
 
-async def answer_group_message(text: str, settings: dict, context: str = "") -> str:
-    style = settings.get("style") or "সহায়ক, ভদ্র ও সংক্ষিপ্ত"
-    length = settings.get("answer_length") or "মাঝারি"
-    custom = settings.get("custom_prompt") or "কোনো অতিরিক্ত নির্দেশ নেই"
-    context_text = f"\nসাম্প্রতিক context:\n{context}" if context and settings.get("context_enabled", True) else ""
-    identity = _identity_instructions(settings)
-    system = (
-        "আপনি Telegram group-এর AI assistant। ব্যবহারকারী যে ভাষায় লিখেছে সেই ভাষাতেই উত্তর দিন। "
-        "নিশ্চিত না হলে বানিয়ে বলবেন না; সংক্ষেপে জানাবেন। "
-        f"Style: {style}. Answer length: {length}. Custom instruction: {custom}. "
-        f"{identity}"
-        f"{_knowledge_block(settings)}"
-        f"{_master_block(settings)}"
-    )
-    return await ask_groq(f"ব্যবহারকারীর message:\n{text}{context_text}", system=system)
+    for admin_id in all_admins:
+        try:
+            await bot_app.bot.send_message(chat_id=admin_id, text=message, parse_mode="Markdown")
+        except Exception:
+            pass
