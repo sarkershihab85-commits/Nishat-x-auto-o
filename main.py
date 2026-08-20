@@ -862,10 +862,17 @@ def main():
     app.add_handler(CommandHandler("optout", optout))
     for command in ("useron", "useroff", "userremove", "userstatus", "retry"):
         app.add_handler(CommandHandler(command, manage_user))
+    def main():
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("optin", optin))
+    app.add_handler(CommandHandler("optout", optout))
+    for command in ("useron", "useroff", "userremove", "userstatus", "retry"):
+        app.add_handler(CommandHandler(command, manage_user))
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forward))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_group))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle))
-print("🚀 Nishat X পোস্ট বট চালু হয়েছে ✅")
+    print("🚀 Nishat X পোস্ট বট চালু হয়েছে ✅")
     app.run_polling()
 
 if __name__ == "__main__":
