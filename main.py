@@ -262,7 +262,9 @@ async def campaign_loop(application):
             save_settings(settings)
 
 
-asyncio.create_task(campaign_loop(application))
+async def post_init(application):
+    import asyncio
+    asyncio.create_task(campaign_loop(application))
 
 # ═══ হ্যান্ডলার ═══
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -863,7 +865,7 @@ def main():
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forward))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_group))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle))
-    print("🚀 Nishat X পোস্ট বট চালু হয়েছে ✅")
+print("🚀 Nishat X পোস্ট বট চালু হয়েছে ✅")
     app.run_polling()
 
 if __name__ == "__main__":
