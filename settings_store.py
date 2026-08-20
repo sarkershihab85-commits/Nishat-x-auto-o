@@ -34,6 +34,10 @@ DEFAULT_SETTINGS = {
         "length": "মূল পোস্টের কাছাকাছি",
         "emoji": True,
         "model": "openai/gpt-oss-120b",
+        "identity_name": "",
+        "owner_name": "",
+        "identity_filter": "",
+        "master_instruction": "",
     },
     "users": {},
     "user_campaign": {
