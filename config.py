@@ -1,18 +1,69 @@
-import os
+import json
 from pathlib import Path
-from dotenv import load_dotenv
+from config import DATA_DIR
 
-load_dotenv()
+SETTINGS_FILE = DATA_DIR / "settings.json"
 
-# ═══ সিক্রেট (Environment Variables থেকে) ═══
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
-API_ID = int(os.getenv("TELEGRAM_API_ID") or "0")
-API_HASH = os.getenv("TELEGRAM_API_HASH")
-SESSION = os.getenv("TELEGRAM_SESSION", "telegram_user")
-PHONE = os.getenv("TELEGRAM_PHONE")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+DEFAULT = {
+    "sources": [],
+    "destinations": [],
+    "delay_minutes": 0,
+    "autopost": False,
+    "template": {"header": "", "footer": ""},
+    "privacy": {
+        "username": {"on": True},
+        "phone": {"on": True},
+        "email": {"on": True},
+        "tme_link": {"on": True},
+    },
+    "replacements": {
+        "contact": "@FastOTP_Nishat",
+    },
+    "forwarding": {
+        "enabled": False,
+        "repeat_count": 1,
+        "repeat_interval_minutes": 0,
+    },
+    "ai": {
+        "enabled": False,
+        "style": "সহায়ক, ভদ্র ও সংক্ষিপ্ত",
+        "length": "মাঝারি",
+        "emoji": True,
+        "custom_prompt": "",
+    },
+    "users": {},
+    "user_campaign": {
+        "enabled": False,
+        "user_ids": [],
+        "message": "",
+        "delay_minutes": 0,
+    },
+    "group_ai": {},
+    "forward_groups": [],
+    "channel_group_forwarding": {
+        "enabled": False,
+        "groups": {},
+        "selected_group": None,
+    },
+}
 
-# ═══ ডাটা ডিরেক্টরি ═══
-DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def load_settings():
+    if SETTINGS_FILE.exists():
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            # missing keys fill from DEFAULT
+            for key, val in DEFAULT.items():
+                if key not in data:
+                    data[key] = val
+            return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return json.loads(json.dumps(DEFAULT))
+
+
+def save_settings(data):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
