@@ -1,38 +1,47 @@
 import re
 
-# 🛡️ প্রাইভেসি ফিল্টার — প্রতিটা রুল ON/OFF (অ্যাডমিন প্যানেল থেকে)
-PRIVACY = {
-    "username": {"on": True,  "pattern": r"@[\w\d_]{3,}"},
-    "tme_link": {"on": True,  "pattern": r"https?://t\.me/[\w\d_]+"},
-    "phone":    {"on": True,  "pattern": r"(?<![\d])(?:\+?88)?01[3-9]\d{8}(?![\d])"},
-    "email":    {"on": True,  "pattern": r"[\w.+-]+@[\w-]+\.[\w.]+"},
-    "user_id":  {"on": False, "pattern": r"(?<![\d])\d{9,10}(?![\d])"},
+# ═══ প্রাইভেসি ফিল্টার — পোস্ট থেকে ব্যক্তিগত তথ্য মুছে ফেলে ═══
+
+PATTERNS = {
+    "username": [
+        re.compile(r"@\w{5,32}"),
+        re.compile(r"t\.me/\w{5,32}"),
+        re.compile(r"telegram\.me/\w{5,32}"),
+    ],
+    "phone": [
+        re.compile(r"\+?\d[\d\s\-]{8,15}"),
+        re.compile(r"\b0\d{3}[\s\-]?\d{6,8}\b"),
+    ],
+    "email": [
+        re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"),
+    ],
+    "tme_link": [
+        re.compile(r"https?://t\.me/\S+"),
+        re.compile(r"t\.me/\S+"),
+    ],
 }
 
-def clean_personal(text: str, enabled_rules=None, replacements=None) -> str:
-    """সব ON রুল প্রয়োগ করে ব্যক্তিগত তথ্য মুছে দেয়"""
-    for name, rule in PRIVACY.items():
-        enabled = rule["on"]
-        if enabled_rules is not None and name in enabled_rules:
-            enabled = enabled_rules[name].get("on", enabled)
-        if enabled:
-            replacement = (replacements or {}).get(name, "")
-            text = re.sub(rule["pattern"], replacement, text)
-    text = re.sub(r"[ \t]+", " ", text)
+
+def clean_personal(text: str, privacy_settings: dict, allowed_contact: str = "") -> str:
+    """
+    privacy_settings = {"username": {"on": True}, "phone": {"on": True}, ...}
+    allowed_contact = "@FastOTP_Nishat" — এটা মুছবে না
+    """
+    if not text:
+        return text
+
+    for key, enabled in privacy_settings.items():
+        if not enabled.get("on", False):
+            continue
+        for pattern in PATTERNS.get(key, []):
+            def replace_match(m):
+                match_text = m.group()
+                if allowed_contact and allowed_contact.lower() in match_text.lower():
+                    return match_text
+                return "***"
+            text = pattern.sub(replace_match, text)
+
+    # অতিরিক্ত খালি লাইন পরিষ্কার
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def replace_personal(text: str, replacements=None) -> str:
-    """Replace detected personal values with admin-configured values."""
-    replacements = replacements or {}
-    values = {
-        "username": replacements.get("username", ""),
-        "phone": replacements.get("phone", ""),
-        "email": replacements.get("email", ""),
-        "tme_link": replacements.get("tme_link", ""),
-    }
-    for name, rule in PRIVACY.items():
-        if name in values and values[name]:
-            text = re.sub(rule["pattern"], values[name], text)
+    text = text.strip()
     return text
