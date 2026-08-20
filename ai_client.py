@@ -12,6 +12,13 @@ import urllib.request
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
+# Groq periodically deprecates/decommissions older model IDs. This is the
+# safe, currently-supported model we fall back to if the configured model
+# in settings.json is no longer valid (HTTP 404 model_not_found), so old
+# deployments don't silently break. Keep in sync with settings_store's
+# DEPRECATED_MODEL_MIGRATIONS default target.
+FALLBACK_MODEL = "openai/gpt-oss-120b"
+
 
 def _request(payload: dict, api_key: str) -> str:
     body = json.dumps(payload).encode("utf-8")
@@ -39,14 +46,13 @@ async def ask_groq(
     prompt: str,
     *,
     system: str,
-    model: str = "openai/gpt-oss-120b",
+    model: str = FALLBACK_MODEL,
     max_tokens: int = 900,
 ) -> str:
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY সেট করা নেই")
-    payload = {
-        "model": model,
+    payload_base = {
         "temperature": 0.35,
         "max_tokens": max(100, min(max_tokens, 1800)),
         "messages": [
@@ -54,15 +60,29 @@ async def ask_groq(
             {"role": "user", "content": prompt},
         ],
     }
+    # Try the configured model first; if Groq says it no longer exists
+    # (deprecated/decommissioned), fall back to FALLBACK_MODEL automatically
+    # instead of failing the whole request.
+    models_to_try = [model] if model == FALLBACK_MODEL else [model, FALLBACK_MODEL]
     last_error = None
-    for attempt in range(2):
-        try:
-            return await asyncio.to_thread(_request, payload, api_key)
-        except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError) as error:
-            last_error = error
-            if attempt == 0:
-                await asyncio.sleep(1)
+    for candidate_model in models_to_try:
+        payload = {**payload_base, "model": candidate_model}
+        for attempt in range(2):
+            try:
+                return await asyncio.to_thread(_request, payload, api_key)
+            except urllib.error.HTTPError as error:
+                last_error = error
+                if error.code == 404:
+                    break  # unknown/deprecated model — stop retrying this one, try next candidate
+                if attempt == 0:
+                    await asyncio.sleep(1)
+            except (urllib.error.URLError, KeyError, ValueError) as error:
+                last_error = error
+                if attempt == 0:
+                    await asyncio.sleep(1)
     raise RuntimeError(f"Groq request failed: {last_error}")
+
+
 
 
 def _identity_instructions(ai: dict) -> str:
@@ -91,6 +111,20 @@ def _identity_instructions(ai: dict) -> str:
     if extra:
         parts.append(f"অতিরিক্ত নিয়ম (admin-সেট করা): {extra}")
     return " ".join(parts)
+
+
+def _knowledge_block(ai: dict) -> str:
+    """Admin-provided reference info (FAQ, product details, rules, etc.) that
+    the AI may draw on when answering. settings['ai']['private_knowledge']."""
+    text = (ai.get("private_knowledge") or "").strip()
+    if not text:
+        return ""
+    return (
+        "\n\n=== অনুমোদিত তথ্য (শুধু প্রাসঙ্গিক প্রশ্নে ব্যবহার করুন) ===\n"
+        f"{text}\n"
+        "এই তথ্যের মধ্যে কোনো password, token, API key বা অন্য গোপনীয় কিছু থাকলে "
+        "তা কখনো প্রকাশ করবেন না।\n=== তথ্য শেষ ===\n"
+    )
 
 
 def _master_block(ai: dict) -> str:
@@ -129,6 +163,7 @@ async def answer_group_message(text: str, settings: dict, context: str = "") -> 
         "নিশ্চিত না হলে বানিয়ে বলবেন না; সংক্ষেপে জানাবেন। "
         f"Style: {style}. Answer length: {length}. Custom instruction: {custom}. "
         f"{identity}"
+        f"{_knowledge_block(settings)}"
         f"{_master_block(settings)}"
     )
     return await ask_groq(f"ব্যবহারকারীর message:\n{text}{context_text}", system=system)
